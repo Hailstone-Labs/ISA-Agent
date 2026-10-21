@@ -1,0 +1,27 @@
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment & Secrets
+.env
+*.local
+
+# Local Vector Database (LanceDB)
+data/
+*.lance/
+lancedb_data/
+
+# OS & Editor Artifacts
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.isa.assistant</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/ISA-Agent/start_isa.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/ISA-Agent</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_NO_CLOUD</key>
+        <string>1</string>
+        <key>OLLAMA_NO_UPDATE_CHECK</key>
+        <string>1</string>
+        <key>OLLAMA_HOST</key>
+        <string>127.0.0.1:11434</string>
+        <key>COPILOT_OFFLINE</key>
+        <string>true</string>
+        <key>OPENCODE_AIRGAPPED</key>
+        <string>1</string>
+        <key>HF_HUB_OFFLINE</key>
+        <string>1</string>
+        <key>PYDANTIC_AI_NO_BANNER</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/path/to/ISA-Agent/data/isa_daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/ISA-Agent/data/isa_daemon.err.log</string>
+</dict>
+</plist>
