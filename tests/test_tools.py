@@ -46,13 +46,22 @@ def test_obsidian_client_loopback_valid() -> None:
 def test_extract_pending_command_ignores_already_answered() -> None:
     doc = (
         "# ISA Inbox\n\n"
-        "@ISA First question\n"
+        "@ISA First question?\n"
         + format_inbox_response("First answer")
     )
     assert extract_pending_command(doc) is None
 
-    doc_with_new = doc + "\n@ISA Second question about tomorrow\n"
-    assert extract_pending_command(doc_with_new) == "Second question about tomorrow"
+    # Mid-sentence auto-save with just a single EOF newline and no terminal punctuation should NOT trigger
+    doc_mid_sentence = doc + "\n@ISA Good E\n"
+    assert extract_pending_command(doc_mid_sentence, require_newline=True) is None
+
+    # Complete sentence with terminal punctuation + newline SHOULD trigger
+    doc_with_new = doc + "\n@ISA Second question about tomorrow?\n"
+    assert extract_pending_command(doc_with_new) == "Second question about tomorrow?"
+
+    # Or pressing Enter twice (blank line after command) without punctuation SHOULD trigger
+    doc_double_enter = doc + "\n@ISA Draft standup notes\n\n"
+    assert extract_pending_command(doc_double_enter) == "Draft standup notes"
 
 
 def test_watchdog_inbox_handler_debouncing(tmp_path) -> None:
@@ -66,23 +75,23 @@ def test_watchdog_inbox_handler_debouncing(tmp_path) -> None:
     )
     assert inbox_file.exists()
 
-    inbox_file.write_text("# ISA Inbox\n\n@ISA Hello World\n", encoding="utf-8")
+    inbox_file.write_text("# ISA Inbox\n\n@ISA Hello World!\n", encoding="utf-8")
 
     class DummyEvent:
         is_directory = False
         src_path = str(inbox_file)
 
     handler.on_modified(DummyEvent())
-    assert triggered == ["Hello World"]
+    assert triggered == ["Hello World!"]
 
     handler.on_modified(DummyEvent())
     assert len(triggered) == 1
 
     inbox_file.write_text(
-        "# ISA Inbox\n\n@ISA Hello World\n" + format_inbox_response("Hello!"),
+        "# ISA Inbox\n\n@ISA Hello World!\n" + format_inbox_response("Hello!"),
         encoding="utf-8",
     )
-    handler.record_agent_write(dispatched_command="Hello World")
+    handler.record_agent_write(dispatched_command="Hello World!")
     handler.on_modified(DummyEvent())
     assert len(triggered) == 1
     assert RESPONSE_END_MARKER in inbox_file.read_text(encoding="utf-8")

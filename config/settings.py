@@ -67,17 +67,23 @@ class ISASettings(BaseSettings):
     )
     debounce_seconds: float = Field(default=1.0, alias="ISA_DEBOUNCE_SECONDS")
 
-    # Semantic Memory (LanceDB) settings
+    # Semantic Memory (LanceDB & Rolling Context) settings
     lancedb_uri: Path = Field(default=Path("./data/lancedb"), alias="LANCEDB_URI")
     embedding_model: str = Field(
         default="BAAI/bge-small-en-v1.5", alias="ISA_EMBEDDING_MODEL"
     )
     rrf_k: int = Field(default=60, alias="ISA_RRF_K")
+    context_window_size: int = Field(default=10, alias="ISA_CONTEXT_WINDOW_SIZE")
 
     @property
     def inbox_path(self) -> Path:
         """Full filesystem path to the monitored Obsidian inbox Markdown note."""
         return self.obsidian_vault_path / self.inbox_filename
+
+    @property
+    def context_window_path(self) -> Path:
+        """Filesystem path where the rolling 10-entry context window is persisted."""
+        return self.lancedb_uri.parent / "rolling_context.json"
 
 
 def get_settings() -> ISASettings:

@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime
+import fcntl
 import logging
+import os
 import resource
 import signal
 import time
 import httpx
 from config.settings import enforce_airgap_env, get_settings
 from src.agent import ISADependencies, build_isa_agent, dispatch_inbox_command
+from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import LocalEmbedder
 from src.memory.vector_db import LocalVectorStore, ingest_vault_to_lancedb
 from src.monitor.observer import create_inbox_observer, extract_pending_command
@@ -96,6 +99,21 @@ async def verify_sprint1_environment(write_hello: bool = True) -> int:
     return 0
 
 
+def clear_rolling_memory() -> None:
+    """Reset the persisted rolling context window JSON to a clean empty state."""
+    settings = get_settings()
+    window = RollingContextWindow(
+        max_entries=settings.context_window_size,
+        persist_path=settings.context_window_path,
+    )
+    window.clear()
+    logger.info(
+        "Cleared rolling context memory at %s (0/%d entries).",
+        settings.context_window_path,
+        settings.context_window_size,
+    )
+
+
 def run_ingestion() -> int:
     """Ingest all Markdown notes in the Obsidian vault into LanceDB."""
     enforce_airgap_env()
@@ -152,11 +170,16 @@ async def process_once() -> int:
     obsidian = ObsidianRestClient(settings)
     vector_store = LocalVectorStore(settings)
     embedder = LocalEmbedder(settings)
+    context_window = RollingContextWindow(
+        max_entries=settings.context_window_size,
+        persist_path=settings.context_window_path,
+    )
     deps = ISADependencies(
         settings=settings,
         obsidian=obsidian,
         vector_store=vector_store,
         embedder=embedder,
+        context_window=context_window,
     )
 
     content = await obsidian.get_note(settings.inbox_filename)
@@ -169,10 +192,40 @@ async def process_once() -> int:
     return 0
 
 
-async def run_watchdog_daemon() -> int:
+async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     """Run the asynchronous watchdog event loop monitoring ISA_Inbox.md."""
     enforce_airgap_env()
     settings = get_settings()
+
+    # Acquire exclusive single-instance lock so two daemons never run simultaneously
+    lock_path = settings.lancedb_uri.parent / "isa_daemon.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.seek(0)
+        existing_pid = lock_file.read().strip() or "unknown"
+        if memory_cleared:
+            logger.info(
+                "Rolling context memory cleared on disk; active ISA daemon (PID=%s) will use the clean slate on the next turn.",
+                existing_pid,
+            )
+            lock_file.close()
+            return 0
+        logger.error(
+            "Another ISA watchdog daemon is already running (PID=%s). "
+            "Exiting to prevent duplicate responses.",
+            existing_pid,
+        )
+        lock_file.close()
+        return 1
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+
     obsidian = ObsidianRestClient(settings)
     vector_store = LocalVectorStore(settings)
     embedder = LocalEmbedder(settings)
@@ -184,11 +237,34 @@ async def run_watchdog_daemon() -> int:
         vector_store=vector_store,
     )
 
+    context_window = RollingContextWindow(
+        max_entries=settings.context_window_size,
+        persist_path=settings.context_window_path,
+    )
+    if (
+        not memory_cleared
+        and not settings.context_window_path.exists()
+        and settings.inbox_path.exists()
+    ):
+        try:
+            context_window.sync_from_inbox_markdown(
+                settings.inbox_path.read_text(encoding="utf-8")
+            )
+        except OSError:
+            pass
+    logger.info(
+        "Initialized rolling context window (%d/%d entries active at %s).",
+        len(context_window),
+        settings.context_window_size,
+        settings.context_window_path,
+    )
+
     deps = ISADependencies(
         settings=settings,
         obsidian=obsidian,
         vector_store=vector_store,
         embedder=embedder,
+        context_window=context_window,
     )
     agent = build_isa_agent(settings)
     reminder_monitor = ActiveReminderMonitor(
@@ -256,16 +332,31 @@ async def run_watchdog_daemon() -> int:
 
             if queue_task in done:
                 _ = queue_task.result()
+                # True trailing-edge quiet window: wait until 2.5s have passed with zero file edits
+                settle_window = max(settings.debounce_seconds, 2.5)
                 while True:
+                    elapsed = time.monotonic() - handler.last_user_edit_time
+                    remaining = settle_window - elapsed
+                    if remaining <= 0:
+                        break
                     try:
-                        _ = await asyncio.wait_for(command_queue.get(), timeout=0.4)
+                        _ = await asyncio.wait_for(
+                            command_queue.get(), timeout=remaining
+                        )
                     except TimeoutError:
+                        pass
+
+                # Drain any residual notifications accumulated during settle
+                while not command_queue.empty():
+                    try:
+                        command_queue.get_nowait()
+                    except asyncio.QueueEmpty:
                         break
 
                 try:
                     latest_content = settings.inbox_path.read_text(encoding="utf-8")
                     cmd = extract_pending_command(latest_content, require_newline=True)
-                    if cmd:
+                    if cmd and handler.can_dispatch_command(cmd):
                         await dispatch_inbox_command(
                             command=cmd,
                             deps=deps,
@@ -278,6 +369,11 @@ async def run_watchdog_daemon() -> int:
         reminder_task.cancel()
         observer.stop()
         observer.join(timeout=5.0)
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
         logger.info("Watchdog daemon stopped cleanly.")
 
     return 0
@@ -305,7 +401,15 @@ def main() -> int:
         action="store_true",
         help="Process a single pending @ISA command in ISA_Inbox.md and exit.",
     )
+    parser.add_argument(
+        "--clear-memory",
+        action="store_true",
+        help="Clear the persisted rolling context window JSON before starting ISA.",
+    )
     args = parser.parse_args()
+
+    if args.clear_memory:
+        clear_rolling_memory()
 
     if args.check:
         return asyncio.run(verify_sprint1_environment(write_hello=True))
@@ -316,7 +420,7 @@ def main() -> int:
     if args.once:
         return asyncio.run(process_once())
 
-    return asyncio.run(run_watchdog_daemon())
+    return asyncio.run(run_watchdog_daemon(memory_cleared=args.clear_memory))
 
 
 if __name__ == "__main__":

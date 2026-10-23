@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import pytest
 from config.settings import ISASettings, enforce_airgap_env
-from src.agent import build_isa_agent, build_local_model
+from src.agent import build_isa_agent, build_local_model, format_inbox_response
+from src.memory.context_window import RollingContextWindow, parse_inbox_entries
 from src.memory.ingest import MarkdownHeaderTextSplitter
 from src.memory.vector_db import (
     LocalVectorStore,
@@ -119,3 +120,60 @@ def test_vault_ingest_and_hybrid_rrf_search(tmp_path) -> None:
     assert len(results) >= 1
     assert "PROJECT-X99-OMEGA" in results[0]["text"]
     assert results[0]["matched_bm25"] is True
+
+
+def test_rolling_context_window_retains_last_ten_entries(tmp_path) -> None:
+    persist_file = tmp_path / "rolling_context.json"
+    window = RollingContextWindow(max_entries=10, persist_path=persist_file)
+
+    for i in range(1, 16):
+        window.add_entry(
+            user_prompt=f"Question {i}",
+            assistant_response=f"Answer {i}",
+            timestamp=f"2026-10-22 10:{i:02d}:00",
+        )
+
+    assert len(window) == 10
+    assert window.entries[0].user_prompt == "Question 6"
+    assert window.entries[-1].user_prompt == "Question 15"
+
+    # Reload from disk and verify persistence of the 10-entry window
+    reloaded = RollingContextWindow(max_entries=10, persist_path=persist_file)
+    assert len(reloaded) == 10
+    assert reloaded.entries[0].user_prompt == "Question 6"
+    assert reloaded.entries[-1].assistant_response == "Answer 15"
+
+    prompt_block = reloaded.format_for_system_prompt()
+    assert "Last 10 of max 10 entries" in prompt_block
+    assert "Question 6" in prompt_block
+    assert "Question 5" not in prompt_block
+
+    # Test clearing memory resets both in-memory entries and persisted JSON file
+    reloaded.clear()
+    assert len(reloaded) == 0
+    assert persist_file.read_text(encoding="utf-8").strip() == "[]"
+
+    # Test self-healing recovery when rolling_context.json is corrupted
+    persist_file.write_text("{corrupted_json: [1, 2", encoding="utf-8")
+    recovered = RollingContextWindow(max_entries=10, persist_path=persist_file)
+    assert len(recovered) == 0
+    assert persist_file.read_text(encoding="utf-8").strip() == "[]"
+
+
+def test_sync_rolling_window_from_inbox_markdown() -> None:
+    parts = ["# ISA Inbox\n"]
+    for i in range(1, 13):
+        parts.append(f"\n@ISA Prompt number {i}\n")
+        parts.append(format_inbox_response(f"Response number {i}"))
+    # Add a trailing unanswered prompt (should not be included in completed history)
+    parts.append("\n@ISA Pending question 13\n")
+    inbox_md = "".join(parts)
+
+    parsed = parse_inbox_entries(inbox_md)
+    assert len(parsed) == 12
+
+    window = RollingContextWindow(max_entries=10)
+    count = window.sync_from_inbox_markdown(inbox_md)
+    assert count == 10
+    assert window.entries[0].user_prompt == "Prompt number 3"
+    assert window.entries[-1].user_prompt == "Prompt number 12"

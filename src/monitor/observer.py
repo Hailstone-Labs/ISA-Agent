@@ -1,4 +1,4 @@
-"""Watchdog file-system event monitor for ISA_Inbox.md with hash/timestamp debouncing."""
+"""Watchdog file-system event monitor for ISA_Inbox.md with trailing-edge debouncing."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from watchdog.observers import Observer
 
 RESPONSE_END_MARKER = "<!-- ISA_RESPONSE_END -->"
 THINKING_START_MARKER = "<!-- ISA_THINKING_START -->"
+COMPLETE_SENTENCE_ENDINGS = (".", "?", "!", '"', "'", ")", "]")
 
 
 def extract_pending_command(
@@ -22,9 +23,10 @@ def extract_pending_command(
 ) -> str | None:
     """Extract an unanswered @ISA command appearing after the last agent response.
 
-    When `require_newline=True` (default), the user must press Enter/Return after
-    typing their `@ISA ...` prompt so Obsidian's mid-sentence auto-save does not
-    prematurely dispatch an incomplete prompt.
+    When `require_newline=True` (live Watchdog mode), prevents premature mid-sentence
+    triggers from Obsidian's background auto-save by requiring either:
+      1. An explicit blank line (`\\n\\n`) after the `@ISA ...` prompt (pressing Enter twice), OR
+      2. A newline (`\\n`) AND the prompt ending with terminal punctuation (`.`, `?`, `!`).
     """
     if THINKING_START_MARKER in content:
         # Agent is currently processing a command
@@ -50,13 +52,24 @@ def extract_pending_command(
 
     last_match = matches[-1]
     raw_after_trigger = trailing[last_match.end() :]
-
-    if require_newline and "\n" not in raw_after_trigger:
-        # User is still typing on the @ISA line and hasn't pressed Enter yet
+    command = raw_after_trigger.strip()
+    if not command:
         return None
 
-    command = raw_after_trigger.strip()
-    return command if command else None
+    if require_newline:
+        has_newline_after = "\n" in raw_after_trigger
+        if not has_newline_after:
+            return None
+        # Check if user pressed Enter twice (blank line after command) or finished a sentence
+        after_command_idx = raw_after_trigger.find(command) + len(command)
+        trailing_whitespace = raw_after_trigger[after_command_idx:]
+        has_blank_line_after = "\n\n" in trailing_whitespace or "\r\n\r\n" in trailing_whitespace
+        ends_with_punctuation = command.endswith(COMPLETE_SENTENCE_ENDINGS)
+
+        if not (has_blank_line_after or ends_with_punctuation):
+            return None
+
+    return command
 
 
 class InboxEventHandler(FileSystemEventHandler):
@@ -77,8 +90,9 @@ class InboxEventHandler(FileSystemEventHandler):
         self.trigger_prefix = trigger_prefix
         self.require_newline = require_newline
         self._last_hash: str | None = self._compute_hash()
-        self._last_trigger_time: float = 0.0
+        self._last_agent_write_time: float = 0.0
         self._last_command_hash: str | None = None
+        self.last_user_edit_time: float = 0.0
 
     def _compute_hash(self) -> str | None:
         if not self.inbox_path.exists():
@@ -92,27 +106,42 @@ class InboxEventHandler(FileSystemEventHandler):
     def record_agent_write(self, dispatched_command: str | None = None) -> None:
         """Update stored MD5 hash after the agent writes to the inbox to avoid loop cascade."""
         self._last_hash = self._compute_hash()
-        self._last_trigger_time = time.monotonic()
+        self._last_agent_write_time = time.monotonic()
         if dispatched_command is not None:
             self._last_command_hash = hashlib.md5(
                 dispatched_command.encode("utf-8")
             ).hexdigest()
 
+    def can_dispatch_command(self, command: str) -> bool:
+        """Return True if this command has not just been dispatched."""
+        cmd_hash = hashlib.md5(command.encode("utf-8")).hexdigest()
+        return cmd_hash != self._last_command_hash
+
+    def mark_command_dispatched(self, command: str) -> None:
+        """Record the hash of the command being dispatched to prevent duplicate runs."""
+        self._last_command_hash = hashlib.md5(command.encode("utf-8")).hexdigest()
+
     def _check_and_dispatch(self) -> None:
         now = time.monotonic()
-        if (now - self._last_trigger_time) < self.debounce_seconds:
-            return
+        # Ignore filesystem echo events immediately following an agent write
+        if (now - self._last_agent_write_time) < 0.35:
+            current_hash = self._compute_hash()
+            if current_hash == self._last_hash:
+                return
 
         current_hash = self._compute_hash()
         if current_hash is None or current_hash == self._last_hash:
             return
 
         self._last_hash = current_hash
-        self._last_trigger_time = now
+        self.last_user_edit_time = now
 
         try:
             content = self.inbox_path.read_text(encoding="utf-8")
         except OSError:
+            return
+
+        if THINKING_START_MARKER in content:
             return
 
         command = extract_pending_command(
@@ -123,11 +152,11 @@ class InboxEventHandler(FileSystemEventHandler):
         if not command:
             return
 
-        cmd_hash = hashlib.md5(command.encode("utf-8")).hexdigest()
-        if cmd_hash == self._last_command_hash:
+        if not self.can_dispatch_command(command):
             return
 
-        self._last_command_hash = cmd_hash
+        # Notify the async loop that a candidate command is ready (the async loop
+        # will wait for the trailing-edge quiet period before locking & dispatching)
         self.on_user_command(command)
 
     def _matches_inbox(self, path_bytes_or_str: bytes | str) -> bool:

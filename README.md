@@ -159,6 +159,7 @@ cp .env.example .env
 | `LANCEDB_URI` | `./data/lancedb` | Local directory for serverless LanceDB tables |
 | `ISA_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local FastEmbed ONNX model cached in `./data/models` |
 | `ISA_RRF_K` | `60` | Smoothing constant $k$ for Reciprocal Rank Fusion |
+| `ISA_CONTEXT_WINDOW_SIZE` | `10` | Number of recent conversation entries retained in `data/rolling_context.json` |
 
 ---
 
@@ -207,6 +208,8 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 3. **Reciprocal Rank Fusion (RRF)**:
    - Reconciles dense and BM25 rankings without arbitrary weight tuning:
      $$\text{RRF\_Score}(d) = \sum_{r \in \{\text{dense}, \text{bm25}\}} \frac{1}{k + \text{rank}_r(d)} \quad (k = 60)$$
+4. **Rolling 10-Entry Conversational Context Window ([`src/memory/context_window.py`](src/memory/context_window.py))**:
+   - Retains the most recent 10 `(user_prompt, assistant_response)` exchanges in a fixed-capacity FIFO window persisted at `data/rolling_context.json` (and self-heals or resets cleanly via `./start_isa.sh --clear-memory`).
 
 ---
 
@@ -241,6 +244,9 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 
 # Process a single pending @ISA command in ISA_Inbox.md and exit
 ./start_isa.sh --once
+
+# Clear the rolling 10-entry context window (data/rolling_context.json) for a clean slate
+./start_isa.sh --clear-memory
 
 # Run the continuous Watchdog + Active Reminder daemon (Default)
 ./start_isa.sh
@@ -286,6 +292,7 @@ ISA-Agent/
 │   ├── main.py                  # CLI entry point & async watchdog/reminder event loop
 │   ├── memory/
 │   │   ├── __init__.py
+│   │   ├── context_window.py    # Rolling 10-entry conversational context window & JSON persistence
 │   │   ├── ingest.py            # MarkdownHeaderTextSplitter & offline FastEmbed
 │   │   └── vector_db.py         # Embedded LanceDB store, BM25Plus, & RRF fusion
 │   ├── monitor/

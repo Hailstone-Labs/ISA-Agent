@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import re
@@ -13,6 +14,7 @@ from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from config.settings import ISASettings, get_settings
+from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import EmbedderProtocol, LocalEmbedder
 from src.memory.vector_db import LocalVectorStore
 from src.monitor.observer import (
@@ -46,8 +48,10 @@ class ISADependencies:
     obsidian: ObsidianRestClient
     vector_store: LocalVectorStore | None = None
     embedder: EmbedderProtocol | None = None
+    context_window: RollingContextWindow | None = None
     handler: InboxEventHandler | None = None
     active_command: str = ""
+    inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def build_local_model(settings: ISASettings | None = None) -> OpenAIChatModel:
@@ -81,21 +85,24 @@ def format_thinking_block(
 
 
 async def _update_thinking_status(deps: ISADependencies, status_line: str) -> None:
-    """Update the live thinking indicator inside ISA_Inbox.md."""
-    try:
-        current = await deps.obsidian.get_note(deps.settings.inbox_filename)
-        new_block = format_thinking_block(deps.active_command, status_line)
-        if THINKING_START_MARKER in current:
-            updated = THINKING_BLOCK_REGEX.sub(new_block, current)
-            await deps.obsidian.create_or_overwrite_note(
-                deps.settings.inbox_filename, updated
-            )
-        else:
-            await deps.obsidian.append_to_note(deps.settings.inbox_filename, new_block)
-        if deps.handler is not None:
-            deps.handler.record_agent_write(dispatched_command=deps.active_command)
-    except Exception as exc:
-        logger.debug("Could not update thinking block: %s", exc)
+    """Update the live thinking indicator inside ISA_Inbox.md with an async lock to prevent races."""
+    async with deps.inbox_lock:
+        try:
+            current = await deps.obsidian.get_note(deps.settings.inbox_filename)
+            new_block = format_thinking_block(deps.active_command, status_line)
+            if THINKING_START_MARKER in current:
+                updated = THINKING_BLOCK_REGEX.sub(new_block, current)
+                await deps.obsidian.create_or_overwrite_note(
+                    deps.settings.inbox_filename, updated
+                )
+            else:
+                await deps.obsidian.append_to_note(
+                    deps.settings.inbox_filename, new_block
+                )
+            if deps.handler is not None:
+                deps.handler.record_agent_write(dispatched_command=deps.active_command)
+        except Exception as exc:
+            logger.debug("Could not update thinking block: %s", exc)
 
 
 def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencies, str]:
@@ -130,6 +137,12 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
     def inject_temporal_context() -> str:
         now_str = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
         return f"Current System Time: {now_str}"
+
+    @agent.system_prompt
+    def inject_rolling_context(ctx: RunContext[ISADependencies]) -> str:
+        if ctx.deps.context_window is None:
+            return ""
+        return ctx.deps.context_window.format_for_system_prompt()
 
     @agent.tool
     async def search_vault(ctx: RunContext[ISADependencies], query: str) -> str:
@@ -365,7 +378,34 @@ async def dispatch_inbox_command(
     active_agent = agent or build_isa_agent(deps.settings)
     deps.handler = handler
     deps.active_command = command
-    logger.info("Dispatching @ISA command to %s: %r", deps.settings.llm_model, command)
+    if handler is not None:
+        handler.mark_command_dispatched(command)
+    if deps.context_window is None:
+        deps.context_window = RollingContextWindow(
+            max_entries=deps.settings.context_window_size,
+            persist_path=deps.settings.context_window_path,
+        )
+
+    # Reload rolling context window from disk (or seed from inbox only if JSON file does not exist yet)
+    try:
+        if (
+            deps.context_window.persist_path
+            and deps.context_window.persist_path.exists()
+        ):
+            deps.context_window.reload_from_disk()
+        else:
+            inbox_before = await deps.obsidian.get_note(deps.settings.inbox_filename)
+            deps.context_window.sync_from_inbox_markdown(inbox_before)
+    except Exception as exc:
+        logger.debug("Could not sync rolling context: %s", exc)
+
+    logger.info(
+        "Dispatching @ISA command to %s (rolling context=%d/%d entries): %r",
+        deps.settings.llm_model,
+        len(deps.context_window),
+        deps.context_window.max_entries,
+        command,
+    )
 
     await _update_thinking_status(deps, "🧠 Thinking with local Gemma 4 12B...")
 
@@ -373,24 +413,30 @@ async def dispatch_inbox_command(
         result = await active_agent.run(command, deps=deps)
         reply_text = result.output
         formatted_block = format_inbox_response(reply_text)
+        deps.context_window.add_entry(
+            user_prompt=command,
+            assistant_response=reply_text,
+        )
     except Exception as exc:
         logger.exception("Error during LLM execution: %s", exc)
         reply_text = f"Error processing request: `{exc}`"
         formatted_block = format_inbox_response(reply_text)
 
-    current = await deps.obsidian.get_note(deps.settings.inbox_filename)
-    if THINKING_START_MARKER in current:
-        updated = THINKING_BLOCK_REGEX.sub(formatted_block, current)
-        await deps.obsidian.create_or_overwrite_note(
-            deps.settings.inbox_filename, updated
-        )
-    else:
-        await deps.obsidian.append_to_note(
-            deps.settings.inbox_filename, formatted_block
-        )
+    async with deps.inbox_lock:
+        current = await deps.obsidian.get_note(deps.settings.inbox_filename)
+        if THINKING_START_MARKER in current:
+            cleaned_current = THINKING_BLOCK_REGEX.sub("", current).rstrip()
+            updated = f"{cleaned_current}{formatted_block}"
+            await deps.obsidian.create_or_overwrite_note(
+                deps.settings.inbox_filename, updated
+            )
+        else:
+            await deps.obsidian.append_to_note(
+                deps.settings.inbox_filename, formatted_block
+            )
 
-    if handler is not None:
-        handler.record_agent_write(dispatched_command=command)
+        if handler is not None:
+            handler.record_agent_write(dispatched_command=command)
 
     logger.info(
         "Appended ISA response (%d chars) to %s",
