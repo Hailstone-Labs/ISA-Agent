@@ -251,10 +251,12 @@ def scaffold_vault_files(vault_path: Path) -> None:
             "## Active Dashboard\n"
             "```tasks\n"
             "not done\n"
+            "path does not include ISA_Inbox\n"
+            "path does not include Templates\n"
+            "description regex does not match /^$/\n"
             "sort by priority\n"
             "sort by due\n"
-            "```\n\n"
-            "## Task List\n\n",
+            "```\n",
             encoding="utf-8",
         )
 

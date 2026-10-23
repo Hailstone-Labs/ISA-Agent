@@ -66,6 +66,11 @@ class ISASettings(BaseSettings):
         default="Calendar", alias="ISA_CALENDAR_FOLDER"
     )
     debounce_seconds: float = Field(default=1.0, alias="ISA_DEBOUNCE_SECONDS")
+    manual_trigger_only: bool = Field(
+        default=False,
+        alias="ISA_MANUAL_TRIGGER_ONLY",
+        description="If True, triggers when pressing Enter after the prompt, ignoring mid-sentence or terminal punctuation.",
+    )
 
     # Semantic Memory (LanceDB & Rolling Context) settings
     lancedb_uri: Path = Field(default=Path("./data/lancedb"), alias="LANCEDB_URI")

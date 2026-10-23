@@ -248,7 +248,13 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 # Clear the rolling 10-entry context window (data/rolling_context.json) for a clean slate
 ./start_isa.sh --clear-memory
 
-# Run the continuous Watchdog + Active Reminder daemon (Default)
+# Start with manual trigger mode (triggers on pressing Enter after your prompt; ignores punctuation)
+./start_isa.sh --manual-trigger
+
+# Start with auto trigger mode (triggers on terminal punctuation [.!?] + Enter or Enter twice)
+./start_isa.sh --auto-trigger
+
+# Run the continuous Watchdog + Active Reminder daemon (Interactive prompt for trigger mode)
 ./start_isa.sh
 ```
 

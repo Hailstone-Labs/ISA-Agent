@@ -118,3 +118,15 @@ class ObsidianRestClient:
                 headers=self._headers(),
             )
             response.raise_for_status()
+
+    async def delete_note(self, vault_path: str) -> None:
+        """Delete a Markdown file from the vault (DELETE /vault/{path})."""
+        clean_path = vault_path.lstrip("/")
+        if clean_path == self.settings.inbox_filename or ".." in clean_path:
+            raise ValueError(f"Refusing to delete protected or unsafe path '{vault_path}'.")
+        async with httpx.AsyncClient(verify=self.settings.obsidian_verify_ssl) as client:
+            response = await client.delete(
+                f"{self.base_url}/vault/{clean_path}",
+                headers=self._headers(),
+            )
+            response.raise_for_status()

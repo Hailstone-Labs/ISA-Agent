@@ -297,23 +297,49 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     def on_command_detected(cmd: str) -> None:
         loop.call_soon_threadsafe(command_queue.put_nowait, cmd)
 
+    vault_reindex_lock = asyncio.Lock()
+
+    def on_vault_file_changed(changed_path: Path) -> None:
+        async def _debounced_reindex() -> None:
+            await asyncio.sleep(2.0)
+            elapsed = time.monotonic() - handler.last_vault_edit_time
+            if elapsed < 1.8:
+                return
+            async with vault_reindex_lock:
+                try:
+                    count = ingest_vault_to_lancedb(
+                        settings=settings,
+                        embedder=embedder,
+                        vector_store=vector_store,
+                    )
+                    logger.info("Real-time LanceDB sync completed (%d chunks indexed)", count)
+                except Exception as exc:
+                    logger.debug("Background LanceDB sync failed: %s", exc)
+
+        loop.call_soon_threadsafe(asyncio.create_task, _debounced_reindex())
+
     observer, handler = create_inbox_observer(
         inbox_path=settings.inbox_path,
         on_user_command=on_command_detected,
         debounce_seconds=settings.debounce_seconds,
         require_newline=True,
+        manual_trigger_only=settings.manual_trigger_only,
+        on_vault_change=on_vault_file_changed,
     )
     observer.start()
+    mode_desc = "MANUAL (Single Enter / newline; punctuation ignored)" if settings.manual_trigger_only else "AUTO (Punctuation [.!?] + Enter OR Enter twice)"
     logger.info(
-        "Watchdog daemon monitoring %s (debounce=%.2fs). Waiting for @ISA commands...",
+        "Watchdog daemon monitoring %s (debounce=%.2fs, mode=%s). Waiting for @ISA commands...",
         settings.inbox_path,
         settings.debounce_seconds,
+        mode_desc,
     )
 
     if settings.inbox_path.exists():
         initial_cmd = extract_pending_command(
             settings.inbox_path.read_text(encoding="utf-8"),
             require_newline=True,
+            manual_trigger_only=settings.manual_trigger_only,
         )
         if initial_cmd:
             await command_queue.put(initial_cmd)
@@ -355,7 +381,11 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
 
                 try:
                     latest_content = settings.inbox_path.read_text(encoding="utf-8")
-                    cmd = extract_pending_command(latest_content, require_newline=True)
+                    cmd = extract_pending_command(
+                        latest_content,
+                        require_newline=True,
+                        manual_trigger_only=settings.manual_trigger_only,
+                    )
                     if cmd and handler.can_dispatch_command(cmd):
                         await dispatch_inbox_command(
                             command=cmd,
@@ -406,7 +436,22 @@ def main() -> int:
         action="store_true",
         help="Clear the persisted rolling context window JSON before starting ISA.",
     )
+    parser.add_argument(
+        "--manual-trigger",
+        action="store_true",
+        help="Trigger on pressing Enter (a newline) after the prompt, ignoring terminal punctuation.",
+    )
+    parser.add_argument(
+        "--auto-trigger",
+        action="store_true",
+        help="Trigger on terminal punctuation (.!?) + Enter or pressing Enter twice.",
+    )
     args = parser.parse_args()
+
+    if args.manual_trigger:
+        os.environ["ISA_MANUAL_TRIGGER_ONLY"] = "true"
+    elif args.auto_trigger:
+        os.environ["ISA_MANUAL_TRIGGER_ONLY"] = "false"
 
     if args.clear_memory:
         clear_rolling_memory()

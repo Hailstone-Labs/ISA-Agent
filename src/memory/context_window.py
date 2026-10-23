@@ -9,6 +9,13 @@ import logging
 from pathlib import Path
 import re
 from pydantic import BaseModel, Field
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from src.monitor.observer import RESPONSE_END_MARKER
 
 logger = logging.getLogger("isa.memory.context_window")
@@ -31,6 +38,10 @@ class ConversationEntry(BaseModel):
     timestamp: str = Field(
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         description="Timestamp when the response was recorded",
+    )
+    tool_context: list[str] = Field(
+        default_factory=list,
+        description="Grounded tool evidence/actions captured during this turn for follow-up consistency",
     )
 
 
@@ -115,16 +126,34 @@ class RollingContextWindow:
         user_prompt: str,
         assistant_response: str,
         timestamp: str | None = None,
+        tool_context: list[str] | None = None,
     ) -> ConversationEntry:
         """Append a new entry to the rolling window, automatically evicting the oldest if > max_entries."""
         entry = ConversationEntry(
             user_prompt=user_prompt.strip(),
             assistant_response=assistant_response.strip(),
             timestamp=timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            tool_context=[t.strip() for t in (tool_context or []) if t and t.strip()],
         )
         self._entries.append(entry)
         self._save_to_disk()
         return entry
+
+    def to_pydantic_messages(self, max_chars_per_entry: int = 1200) -> list[ModelMessage]:
+        """Convert the rolling window into native PydanticAI ModelRequest/ModelResponse turns."""
+        messages: list[ModelMessage] = []
+        for entry in self._entries:
+            messages.append(
+                ModelRequest(parts=[UserPromptPart(content=entry.user_prompt)])
+            )
+            resp_text = entry.assistant_response
+            if len(resp_text) > max_chars_per_entry:
+                resp_text = resp_text[: max_chars_per_entry - 3] + "..."
+            if entry.tool_context:
+                evidence_lines = "\n".join(f"- {tc}" for tc in entry.tool_context[:4])
+                resp_text = f"{resp_text}\n\n[Grounded Vault Evidence Used in This Turn:\n{evidence_lines}]"
+            messages.append(ModelResponse(parts=[TextPart(content=resp_text)]))
+        return messages
 
     def sync_from_inbox_markdown(self, markdown_content: str) -> int:
         """Hydrate the rolling window with the last `max_entries` exchanges from ISA_Inbox.md."""
@@ -149,10 +178,15 @@ class RollingContextWindow:
             resp_preview = entry.assistant_response
             if len(resp_preview) > max_chars_per_entry:
                 resp_preview = resp_preview[: max_chars_per_entry - 3] + "..."
+            tool_note = ""
+            if entry.tool_context:
+                tool_note = "\nGrounded Tool Evidence: " + " | ".join(
+                    entry.tool_context[:3]
+                )
             lines.append(
                 f"[{idx}] ({entry.timestamp})\n"
                 f"User: {entry.user_prompt}\n"
-                f"ISA: {resp_preview}"
+                f"ISA: {resp_preview}{tool_note}"
             )
         return "\n\n".join(lines)
 

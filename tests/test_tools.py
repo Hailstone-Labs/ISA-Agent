@@ -55,13 +55,26 @@ def test_extract_pending_command_ignores_already_answered() -> None:
     doc_mid_sentence = doc + "\n@ISA Good E\n"
     assert extract_pending_command(doc_mid_sentence, require_newline=True) is None
 
-    # Complete sentence with terminal punctuation + newline SHOULD trigger
+    # Complete sentence with terminal punctuation + newline SHOULD trigger in default mode
     doc_with_new = doc + "\n@ISA Second question about tomorrow?\n"
     assert extract_pending_command(doc_with_new) == "Second question about tomorrow?"
 
-    # Or pressing Enter twice (blank line after command) without punctuation SHOULD trigger
+    # But in manual_trigger_only mode, terminal punctuation + single newline does NOT trigger!
+    assert (
+        extract_pending_command(
+            doc_with_new, require_newline=True, manual_trigger_only=True
+        )
+        is None
+    )
+
+    # In manual mode, pressing Enter twice (blank line after command) DOES trigger
     doc_double_enter = doc + "\n@ISA Draft standup notes\n\n"
-    assert extract_pending_command(doc_double_enter) == "Draft standup notes"
+    assert (
+        extract_pending_command(
+            doc_double_enter, require_newline=True, manual_trigger_only=True
+        )
+        == "Draft standup notes"
+    )
 
 
 def test_watchdog_inbox_handler_debouncing(tmp_path) -> None:
@@ -244,3 +257,37 @@ def test_installer_scaffolding_and_api_key_generation(tmp_path) -> None:
     env_text = env_path.read_text(encoding="utf-8")
     assert f"OBSIDIAN_API_KEY={key1}" in env_text
     assert "OLLAMA_NO_CLOUD=1" in env_text
+
+
+def test_task_deduplication_and_listing(tmp_path) -> None:
+    from src.tools.tasks import _normalize_task_description
+
+    norm1 = _normalize_task_description("- [ ] Submit the weekly budget report 🔁 every week on Friday 📅 2026-10-23 ⏫")
+    norm2 = _normalize_task_description("Submit the weekly budget report")
+    assert norm1 == norm2 == "submit the weekly budget report"
+
+
+def test_calendar_listing_and_cancellation(tmp_path) -> None:
+    from src.tools.calendar import list_vault_calendar_events
+
+    cal_dir = tmp_path / "Calendar"
+    cal_dir.mkdir()
+    event_file = cal_dir / "2026-10-25 - Project Sync.md"
+    event_file.write_text(
+        "---\n"
+        "title: Project Sync\n"
+        "allDay: false\n"
+        "startTime: 14:00\n"
+        "endTime: 15:00\n"
+        "date: 2026-10-25\n"
+        "endDate: 2026-10-25\n"
+        "type: single\n"
+        "---\n"
+        "Discussion notes.\n",
+        encoding="utf-8",
+    )
+
+    events = list_vault_calendar_events(vault_path=tmp_path, folder="Calendar")
+    assert len(events) == 1
+    assert events[0]["title"] == "Project Sync"
+    assert events[0]["date"] == "2026-10-25"

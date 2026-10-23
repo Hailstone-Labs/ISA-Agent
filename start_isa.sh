@@ -20,4 +20,23 @@ if [[ ! -d ".venv" ]]; then
 fi
 
 echo "[ISA] Air-gap environment variables enforced (OLLAMA_HOST=${OLLAMA_HOST})."
-exec .venv/bin/python -m src.main "$@"
+
+# Interactive trigger selection if no arguments were passed
+ARGS=("$@")
+if [[ $# -eq 0 ]]; then
+  echo ""
+  echo "Select ISA Trigger Mode:"
+  echo "  1) Single Enter Key   (Recommended - triggers when pressing Enter after prompt; ignores punctuation)"
+  echo "  2) Auto / Punctuation (Triggers on sentence ending punctuation [.!?] + Enter OR Enter twice)"
+  echo ""
+  read -r "choice?Enter choice [1 or 2, default 1]: "
+  if [[ "${choice}" == "2" ]]; then
+    echo "[ISA] Starting in Auto / Punctuation mode."
+    ARGS=(--auto-trigger)
+  else
+    echo "[ISA] Starting in Single Enter mode (press Enter after your prompt)."
+    ARGS=(--manual-trigger)
+  fi
+fi
+
+exec .venv/bin/python -m src.main "${ARGS[@]}"

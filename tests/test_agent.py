@@ -160,6 +160,31 @@ def test_rolling_context_window_retains_last_ten_entries(tmp_path) -> None:
     assert persist_file.read_text(encoding="utf-8").strip() == "[]"
 
 
+def test_rolling_context_window_pydantic_messages_and_tool_evidence(tmp_path) -> None:
+    persist_file = tmp_path / "rolling_context.json"
+    window = RollingContextWindow(max_entries=5, persist_path=persist_file)
+    window.add_entry(
+        user_prompt="What meetings do I have tomorrow?",
+        assistant_response="You have a sync with Alice at 10:00.",
+        tool_context=["Found Calendar/2026-10-24 - Sync with Alice.md"],
+    )
+    assert len(window) == 1
+    assert window.entries[0].tool_context == ["Found Calendar/2026-10-24 - Sync with Alice.md"]
+
+    messages = window.to_pydantic_messages()
+    assert len(messages) == 2
+    assert "What meetings do I have tomorrow?" in messages[0].parts[0].content
+    assert "Found Calendar/2026-10-24 - Sync with Alice.md" in messages[1].parts[0].content
+
+
+def test_format_inbox_response_has_clean_callout_spacing_and_cursor() -> None:
+    formatted = format_inbox_response("Here is the answer.", include_next_prompt_stub=True)
+    # Must have blank line between callout and marker
+    assert "> Here is the answer.\n\n<!-- ISA_RESPONSE_END -->" in formatted
+    # Must have horizontal rule and Templater cursor placeholder well below the callout
+    assert "---\n\n@ISA <% tp.file.cursor() %>\n" in formatted
+
+
 def test_sync_rolling_window_from_inbox_markdown() -> None:
     parts = ["# ISA Inbox\n"]
     for i in range(1, 13):

@@ -13,23 +13,32 @@ from pydantic import ValidationError
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 from config.settings import ISASettings, get_settings
 from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import EmbedderProtocol, LocalEmbedder
-from src.memory.vector_db import LocalVectorStore
+from src.memory.vector_db import LocalVectorStore, ingest_vault_to_lancedb
 from src.monitor.observer import (
+    CURSOR_PLACEHOLDER,
+    FAST_COMMANDS,
     InboxEventHandler,
     RESPONSE_END_MARKER,
     THINKING_START_MARKER,
 )
-from src.tools.calendar import CalendarEventSpec, create_vault_calendar_event
+from src.tools.calendar import (
+    CalendarEventSpec,
+    cancel_vault_calendar_event,
+    create_vault_calendar_event,
+    list_vault_calendar_events,
+)
 from src.tools.documents import (
     SynthesizedDocumentSpec,
     create_synthesized_document,
     instantiate_template_note,
 )
+from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import LOOPBACK_HOSTS, ObsidianRestClient
-from src.tools.tasks import TaskSpec, append_vault_task
+from src.tools.tasks import TaskSpec, append_vault_task, list_vault_tasks
 
 logger = logging.getLogger("isa.agent")
 
@@ -52,6 +61,20 @@ class ISADependencies:
     handler: InboxEventHandler | None = None
     active_command: str = ""
     inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    turn_tool_context: list[str] = field(default_factory=list)
+
+
+def _sync_vault_index_immediately(deps: ISADependencies) -> int:
+    """Re-index vault Markdown files into LanceDB so newly created/deleted notes are immediately searchable."""
+    try:
+        return ingest_vault_to_lancedb(
+            settings=deps.settings,
+            embedder=deps.embedder,
+            vector_store=deps.vector_store,
+        )
+    except Exception as exc:
+        logger.debug("Immediate LanceDB sync warning: %s", exc)
+        return 0
 
 
 def build_local_model(settings: ISASettings | None = None) -> OpenAIChatModel:
@@ -112,6 +135,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
     agent: Agent[ISADependencies, str] = Agent(
         model=model,
         deps_type=ISADependencies,
+        model_settings=ModelSettings(temperature=0.1),
         system_prompt=(
             "You are ISA (Intelligent Secretary Assistant), an air-gapped executive assistant "
             "integrated directly into a local Obsidian vault. Provide concise, accurate, "
@@ -120,16 +144,20 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             "1. When asked to schedule a meeting, appointment, or calendar event, ALWAYS call "
             "`create_calendar_event` with 24-hour HH:MM times (e.g. '10:00', '14:30') and "
             "resolved YYYY-MM-DD dates computed from the Current System Time.\n"
-            "2. When asked to add a task, reminder, or to-do item, ALWAYS call `create_task` "
+            "2. When asked what is on the schedule or calendar, call `list_calendar_events`.\n"
+            "3. When asked to cancel, remove, or delete a calendar meeting or appointment, call `cancel_calendar_event`.\n"
+            "4. When asked what tasks, to-dos, or items exist, call `list_tasks`.\n"
+            "5. When asked to add or create a task, reminder, or to-do item, call `create_task` "
             "with resolved YYYY-MM-DD dates and valid Obsidian Tasks recurrence rules starting "
             "with 'every ' (e.g. 'every week on Friday', 'every weekday').\n"
-            "3. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
+            "6. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
             "'Meeting Minutes Template', 'Project Brief Template'), call `create_note_from_template`.\n"
-            "4. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
+            "7. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
             "call `create_document`.\n"
-            "5. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
+            "8. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
+            "9. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
             "notes, files, projects, or past records in their vault.\n"
-            "6. Never call `search_vault` more than once or twice per request."
+            "10. Never call `search_vault` more than once or twice per request."
         ),
     )
 
@@ -166,6 +194,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
                     f"### File: `{hit['file_path']}` (Section: `{hit['heading_hierarchy']}`, RRF: {hit['rrf_score']:.4f})\n"
                     f"{hit['text']}"
                 )
+                ctx.deps.turn_tool_context.append(
+                    f"Found `{hit['file_path']}` ({hit['heading_hierarchy']}): {hit['text'][:120]}"
+                )
             return "\n\n---\n\n".join(formatted_chunks)
 
         results = await ctx.deps.obsidian.search_simple(query)
@@ -181,6 +212,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
                 m.get("context", "").strip() for m in matches[:2] if m.get("context")
             ]
             formatted.append(f"- **{filename}**: {' ... '.join(snippets)}")
+            ctx.deps.turn_tool_context.append(
+                f"Matched note `{filename}`: {' ... '.join(snippets)[:120]}"
+            )
         return "\n".join(formatted)
 
     @agent.tool
@@ -190,9 +224,76 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             ctx.deps, f"📄 Reading note `{note_path}`..."
         )
         try:
-            return await ctx.deps.obsidian.get_note(note_path)
+            content = await ctx.deps.obsidian.get_note(note_path)
+            ctx.deps.turn_tool_context.append(
+                f"Read `{note_path}` ({len(content)} chars): {content[:140]}"
+            )
+            return content
         except Exception as exc:
             return f"Error reading note '{note_path}': {exc}"
+
+    @agent.tool
+    async def list_calendar_events(
+        ctx: RunContext[ISADependencies],
+        date_filter: str | None = None,
+    ) -> str:
+        """List upcoming and scheduled calendar events recorded in Calendar/*.md.
+
+        Args:
+            date_filter: Optional date in YYYY-MM-DD format to filter events for a specific day.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"📅 Checking scheduled calendar events in `{ctx.deps.settings.calendar_folder}`..."
+        )
+        events = list_vault_calendar_events(
+            vault_path=ctx.deps.settings.obsidian_vault_path,
+            folder=ctx.deps.settings.calendar_folder,
+            date_filter=date_filter,
+        )
+        if not events:
+            filter_msg = f" for date {date_filter}" if date_filter else ""
+            return f"No calendar events found{filter_msg}."
+
+        lines = [f"Found {len(events)} calendar event(s):"]
+        for ev in events:
+            time_str = "All Day" if ev["all_day"] else f"{ev['start_time']}–{ev['end_time']}"
+            item_desc = f"- **{ev['title']}** on {ev['date']} ({time_str}) [`{ev['file_path']}`]"
+            lines.append(item_desc)
+            ctx.deps.turn_tool_context.append(item_desc)
+        return "\n".join(lines)
+
+    @agent.tool
+    async def cancel_calendar_event(
+        ctx: RunContext[ISADependencies],
+        title_query: str,
+        date_filter: str | None = None,
+    ) -> str:
+        """Cancel and delete an Obsidian Full Calendar event note from the vault.
+
+        Args:
+            title_query: Title or keyword of the event to cancel.
+            date_filter: Optional date in YYYY-MM-DD format to target a specific occurrence.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"🗑️ Canceling calendar event matching `{title_query}`..."
+        )
+        deleted = await cancel_vault_calendar_event(
+            obsidian=ctx.deps.obsidian,
+            vault_path=ctx.deps.settings.obsidian_vault_path,
+            title_query=title_query,
+            date_filter=date_filter,
+            folder=ctx.deps.settings.calendar_folder,
+            notify=True,
+        )
+        if not deleted:
+            return f"No scheduled calendar event matched '{title_query}'."
+
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Canceled calendar event: {', '.join(deleted)}")
+        return (
+            f"Successfully canceled and removed {len(deleted)} event(s) from the calendar:\n"
+            + "\n".join(f"- `{p}`" for p in deleted)
+        )
 
     @agent.tool
     async def create_calendar_event(
@@ -237,9 +338,38 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             event=spec,
             folder=ctx.deps.settings.calendar_folder,
         )
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Created event `{spec.title}` on {spec.date} at `{created_path}`")
         return (
             f"Created Obsidian Full Calendar event at `{created_path}`:\n"
             f"```yaml\n{spec.to_markdown().strip()}\n```"
+        )
+
+    @agent.tool
+    async def list_tasks(
+        ctx: RunContext[ISADependencies],
+        include_completed: bool = False,
+    ) -> str:
+        """List active tasks currently recorded in Tasks.md without adding duplicates.
+
+        Args:
+            include_completed: Set to True to also display completed [x] tasks.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"📋 Reading tasks from `{ctx.deps.settings.active_tasks_filename}`..."
+        )
+        tasks = await list_vault_tasks(
+            obsidian=ctx.deps.obsidian,
+            tasks_filename=ctx.deps.settings.active_tasks_filename,
+            include_completed=include_completed,
+        )
+        if not tasks:
+            return f"No open tasks found in `{ctx.deps.settings.active_tasks_filename}`."
+
+        ctx.deps.turn_tool_context.append(f"Listed {len(tasks)} tasks: {'; '.join(tasks[:4])}")
+        return (
+            f"Active tasks in `{ctx.deps.settings.active_tasks_filename}` ({len(tasks)} items):\n"
+            + "\n".join(tasks)
         )
 
     @agent.tool
@@ -281,15 +411,38 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             ctx.deps,
             f"✅ Adding task `{spec.description}` to `{ctx.deps.settings.active_tasks_filename}`...",
         )
-        task_line = await append_vault_task(
+        task_line, created_new = await append_vault_task(
             obsidian=ctx.deps.obsidian,
             task=spec,
             tasks_filename=ctx.deps.settings.active_tasks_filename,
         )
+        if not created_new:
+            ctx.deps.turn_tool_context.append(f"Task already exists on list: {task_line}")
+            return (
+                f"Task is already recorded on your active task list in `{ctx.deps.settings.active_tasks_filename}`:\n"
+                f"`{task_line}`"
+            )
+
+        ctx.deps.turn_tool_context.append(f"Created task: {task_line}")
         return (
             f"Appended task to `{ctx.deps.settings.active_tasks_filename}`:\n"
             f"`{task_line}`"
         )
+
+    @agent.tool
+    async def rescan_vault_database(ctx: RunContext[ISADependencies]) -> str:
+        """Trigger an instant rescan and re-indexing of all vault Markdown notes into LanceDB."""
+        await _update_thinking_status(
+            ctx.deps, "🔄 Rescanning and re-indexing vault memory into LanceDB..."
+        )
+        count = _sync_vault_index_immediately(ctx.deps)
+        send_macos_notification(
+            title="ISA Database Rescanned",
+            subtitle=f"{count} chunks indexed",
+            message="LanceDB Hybrid memory updated successfully.",
+        )
+        ctx.deps.turn_tool_context.append(f"Rescanned database ({count} chunks indexed)")
+        return f"Vault database successfully rescanned and updated ({count} chunks indexed in LanceDB)."
 
     @agent.tool
     async def create_document(
@@ -315,6 +468,8 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             obsidian=ctx.deps.obsidian,
             spec=spec,
         )
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Created document `{saved_path}`")
         return f"Successfully created vault document at `{saved_path}`."
 
     @agent.tool
@@ -350,21 +505,40 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             )
         except ValueError as exc:
             raise ModelRetry(f"Template instantiation failed: {exc}") from exc
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Instantiated `{saved_path}` from template `{template_name}`")
         return (
             f"Successfully instantiated `{saved_path}` from template `{template_name}`."
         )
 
     return agent
 
+    return agent
 
-def format_inbox_response(response_text: str, timestamp: datetime | None = None) -> str:
-    """Format an ISA response block with an end delimiter to prevent re-triggering."""
+
+def format_inbox_response(
+    response_text: str,
+    timestamp: datetime | None = None,
+    include_next_prompt_stub: bool = True,
+) -> str:
+    """Format an ISA response block with strict Obsidian callout separation and a ready-to-type prompt stub.
+
+    Leaves an explicit blank line before and after the blockquote callout and horizontal rule
+    so Obsidian's Live Preview CodeMirror 6 engine fully renders and collapses the callout.
+    Appends an empty '@ISA ' line with a Templater cursor tag well below the response.
+    """
     ts = (timestamp or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     cleaned = response_text.strip()
+    blockquote_lines = "\n".join(
+        f"> {line}" if line else ">" for line in cleaned.splitlines()
+    )
+
+    stub = f"\n\n---\n\n@ISA {CURSOR_PLACEHOLDER}\n" if include_next_prompt_stub else "\n"
     return (
         f"\n\n> [!NOTE] ISA Response ({ts})\n"
-        + "\n".join(f"> {line}" if line else ">" for line in cleaned.splitlines())
-        + f"\n{RESPONSE_END_MARKER}\n"
+        f"{blockquote_lines}\n\n"
+        f"{RESPONSE_END_MARKER}"
+        f"{stub}"
     )
 
 
@@ -375,9 +549,9 @@ async def dispatch_inbox_command(
     agent: Agent[ISADependencies, str] | None = None,
 ) -> str:
     """Display a live thinking banner, run the PydanticAI ReAct loop, and replace with the final reply."""
-    active_agent = agent or build_isa_agent(deps.settings)
     deps.handler = handler
     deps.active_command = command
+    deps.turn_tool_context.clear()
     if handler is not None:
         handler.mark_command_dispatched(command)
     if deps.context_window is None:
@@ -385,6 +559,47 @@ async def dispatch_inbox_command(
             max_entries=deps.settings.context_window_size,
             persist_path=deps.settings.context_window_path,
         )
+
+    # Fast-path for deterministic commands like /rescan
+    clean_cmd = command.strip().lower()
+    if clean_cmd in FAST_COMMANDS:
+        logger.info("Executing fast-path command: %s", clean_cmd)
+        count = _sync_vault_index_immediately(deps)
+        reply_text = (
+            f"🔄 **Vault Database Rescanned Successfully**\n\n"
+            f"- **Chunks Indexed:** {count}\n"
+            f"- **Store:** LanceDB (`{deps.settings.lancedb_uri}`)\n"
+            f"- **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        send_macos_notification(
+            title="ISA Database Rescanned",
+            subtitle=f"{count} chunks indexed",
+            message="LanceDB Hybrid memory updated successfully.",
+        )
+        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
+        deps.context_window.add_entry(
+            user_prompt=command,
+            assistant_response=reply_text,
+            tool_context=[f"Fast-path /rescan: indexed {count} chunks"],
+        )
+        async with deps.inbox_lock:
+            current = await deps.obsidian.get_note(deps.settings.inbox_filename)
+            if THINKING_START_MARKER in current:
+                cleaned_current = THINKING_BLOCK_REGEX.sub("", current).rstrip()
+                updated = f"{cleaned_current}{formatted_block}"
+                await deps.obsidian.create_or_overwrite_note(deps.settings.inbox_filename, updated)
+            else:
+                await deps.obsidian.append_to_note(deps.settings.inbox_filename, formatted_block)
+
+            try:
+                await deps.obsidian.execute_command("templater-obsidian:jump-to-next-cursor-location")
+            except Exception:
+                pass
+            if handler is not None:
+                handler.record_agent_write(dispatched_command=command)
+        return reply_text
+
+    active_agent = agent or build_isa_agent(deps.settings)
 
     # Reload rolling context window from disk (or seed from inbox only if JSON file does not exist yet)
     try:
@@ -410,17 +625,23 @@ async def dispatch_inbox_command(
     await _update_thinking_status(deps, "🧠 Thinking with local Gemma 4 12B...")
 
     try:
-        result = await active_agent.run(command, deps=deps)
+        history_messages = deps.context_window.to_pydantic_messages()
+        result = await active_agent.run(
+            command,
+            deps=deps,
+            message_history=history_messages if history_messages else None,
+        )
         reply_text = result.output
-        formatted_block = format_inbox_response(reply_text)
+        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
         deps.context_window.add_entry(
             user_prompt=command,
             assistant_response=reply_text,
+            tool_context=list(deps.turn_tool_context),
         )
     except Exception as exc:
         logger.exception("Error during LLM execution: %s", exc)
         reply_text = f"Error processing request: `{exc}`"
-        formatted_block = format_inbox_response(reply_text)
+        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
 
     async with deps.inbox_lock:
         current = await deps.obsidian.get_note(deps.settings.inbox_filename)
@@ -434,6 +655,12 @@ async def dispatch_inbox_command(
             await deps.obsidian.append_to_note(
                 deps.settings.inbox_filename, formatted_block
             )
+
+        # Trigger Templater cursor jump so user cursor is automatically placed at the new @ISA prompt line
+        try:
+            await deps.obsidian.execute_command("templater-obsidian:jump-to-next-cursor-location")
+        except Exception:
+            pass
 
         if handler is not None:
             handler.record_agent_write(dispatched_command=command)

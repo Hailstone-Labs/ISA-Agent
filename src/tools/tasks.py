@@ -96,29 +96,73 @@ class TaskSpec(BaseModel):
         return " ".join(parts)
 
 
+def _normalize_task_description(text: str) -> str:
+    """Normalize a task line or description for duplicate detection."""
+    cleaned = re.sub(r"^-\s*\[[ xX]\]\s*", "", text.strip())
+    # Strip trailing Obsidian Tasks emojis and metadata
+    cleaned = re.split(r"\s+(?:🔁|🛫|⏳|📅|⏫|🔼|🔽|#\w+)", cleaned)[0]
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
+
+
+async def list_vault_tasks(
+    obsidian: ObsidianRestClient,
+    tasks_filename: str = "Tasks.md",
+    include_completed: bool = False,
+) -> list[str]:
+    """Read Tasks.md and return current task checklist lines without modifying the file."""
+    try:
+        content = await obsidian.get_note(tasks_filename)
+    except Exception:
+        return []
+
+    tasks: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- [ ]"):
+            tasks.append(stripped)
+        elif include_completed and (
+            stripped.startswith("- [x]") or stripped.startswith("- [X]")
+        ):
+            tasks.append(stripped)
+    return tasks
+
+
 async def append_vault_task(
     obsidian: ObsidianRestClient,
     task: TaskSpec,
     tasks_filename: str = "Tasks.md",
     notify: bool = True,
-) -> str:
-    """Append a formatted inline task to the designated active tasks note in Obsidian."""
+) -> tuple[str, bool]:
+    """Append a formatted inline task to the designated active tasks note in Obsidian.
+
+    Returns `(task_line, created_new)` where `created_new` is False if an open task
+    with the same normalized description already exists in `Tasks.md`.
+    """
     task_line = task.to_task_line()
+    norm_new = _normalize_task_description(task.description)
     try:
         existing = await obsidian.get_note(tasks_filename)
+        for line in existing.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- [ ]"):
+                if _normalize_task_description(stripped) == norm_new:
+                    return stripped, False
         prefix = "" if existing.endswith("\n") else "\n"
         await obsidian.append_to_note(tasks_filename, f"{prefix}{task_line}\n")
     except Exception:
         # Note does not exist yet; create it with a clean header and live Tasks query block
+        # that aggregates vault tasks while filtering out ISA_Inbox.md and Templates/
         initial_doc = (
             "# Tasks\n\n"
             "## Active Dashboard\n"
             "```tasks\n"
             "not done\n"
+            "path does not include ISA_Inbox\n"
+            "path does not include Templates\n"
+            "description regex does not match /^$/\n"
             "sort by priority\n"
             "sort by due\n"
             "```\n\n"
-            "## Task List\n\n"
             f"{task_line}\n"
         )
         await obsidian.create_or_overwrite_note(tasks_filename, initial_doc)
@@ -130,4 +174,4 @@ async def append_vault_task(
             subtitle=due_label,
             message=task.description,
         )
-    return task_line
+    return task_line, True

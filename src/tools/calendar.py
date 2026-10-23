@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 import re
 from typing import Literal
+import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import ObsidianRestClient
@@ -137,3 +139,108 @@ async def create_vault_calendar_event(
             message=event.title,
         )
     return vault_path
+
+
+def _parse_calendar_frontmatter(md_text: str) -> dict:
+    """Parse YAML frontmatter from a Calendar/*.md file."""
+    if not md_text.startswith("---"):
+        return {}
+    parts = md_text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    try:
+        loaded = yaml.safe_load(parts[1])
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def list_vault_calendar_events(
+    vault_path: Path,
+    folder: str = "Calendar",
+    date_filter: str | None = None,
+) -> list[dict]:
+    """Scan Calendar/*.md in the vault and return structured event records."""
+    cal_dir = vault_path / folder.strip("/")
+    if not cal_dir.exists():
+        return []
+
+    events: list[dict] = []
+    for md_file in sorted(cal_dir.glob("*.md")):
+        try:
+            text = md_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = _parse_calendar_frontmatter(text)
+        ev_date = str(meta.get("date", "")).strip()
+        if date_filter and ev_date != date_filter.strip():
+            continue
+        rel_path = str(md_file.relative_to(vault_path))
+        events.append(
+            {
+                "file_path": rel_path,
+                "title": str(meta.get("title", md_file.stem)).strip(),
+                "date": ev_date,
+                "end_date": str(meta.get("endDate", ev_date)).strip(),
+                "all_day": bool(meta.get("allDay", False)),
+                "start_time": str(meta.get("startTime", "")).strip() or None,
+                "end_time": str(meta.get("endTime", "")).strip() or None,
+            }
+        )
+    return events
+
+
+async def cancel_vault_calendar_event(
+    obsidian: ObsidianRestClient,
+    vault_path: Path,
+    title_query: str,
+    date_filter: str | None = None,
+    folder: str = "Calendar",
+    notify: bool = True,
+) -> list[str]:
+    """Delete matching calendar event note(s) and reset the Full Calendar plugin cache."""
+    all_events = list_vault_calendar_events(
+        vault_path=vault_path,
+        folder=folder,
+        date_filter=date_filter,
+    )
+    query_low = title_query.strip().lower()
+    query_tokens = [tok for tok in re.findall(r"\w+", query_low) if len(tok) > 2]
+
+    matched_events: list[dict] = []
+    for ev in all_events:
+        title_low = ev["title"].lower()
+        file_low = ev["file_path"].lower()
+        if (
+            query_low in title_low
+            or title_low in query_low
+            or query_low in file_low
+            or (query_tokens and all(tok in title_low for tok in query_tokens))
+        ):
+            matched_events.append(ev)
+
+    deleted_paths: list[str] = []
+    for ev in matched_events:
+        rel_path = ev["file_path"]
+        try:
+            await obsidian.delete_note(rel_path)
+            deleted_paths.append(rel_path)
+        except Exception:
+            # Fallback to local file unlink if REST API returns 404 or is unreachable in tests
+            local_file = vault_path / rel_path
+            if local_file.exists():
+                local_file.unlink()
+                deleted_paths.append(rel_path)
+
+    if deleted_paths:
+        try:
+            await obsidian.execute_command("obsidian-full-calendar:full-calendar-reset")
+        except Exception:
+            pass
+        if notify:
+            send_macos_notification(
+                title="ISA Canceled Event",
+                subtitle=f"Removed {len(deleted_paths)} calendar entry",
+                message=", ".join(Path(p).stem for p in deleted_paths),
+            )
+    return deleted_paths
