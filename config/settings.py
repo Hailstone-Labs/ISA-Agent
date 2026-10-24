@@ -76,6 +76,11 @@ class ISASettings(BaseSettings):
         alias="ISA_MORNING_BRIEFING_TIME",
         description="24-hour HH:MM time when ISA automatically generates the daily morning briefing (empty string to disable).",
     )
+    isa_theme: str = Field(
+        default="default",
+        alias="ISA_THEME",
+        description="Active visual and persona theme ('default', 'terminal', 'cyberpunk').",
+    )
 
     # Semantic Memory (LanceDB & Rolling Context) settings
     lancedb_uri: Path = Field(default=Path("./data/lancedb"), alias="LANCEDB_URI")
@@ -95,8 +100,24 @@ class ISASettings(BaseSettings):
         """Filesystem path where the rolling 10-entry context window is persisted."""
         return self.lancedb_uri.parent / "rolling_context.json"
 
+    @property
+    def theme_persist_path(self) -> Path:
+        """Filesystem path where the dynamically chosen theme name is persisted."""
+        return self.lancedb_uri.parent / "isa_theme.txt"
+
 
 def get_settings() -> ISASettings:
     """Enforce air-gap environment controls and return validated settings."""
     enforce_airgap_env()
-    return ISASettings()
+    settings = ISASettings()
+    if (
+        "ISA_THEME" not in os.environ
+        and settings.theme_persist_path.exists()
+    ):
+        try:
+            saved_theme = settings.theme_persist_path.read_text(encoding="utf-8").strip()
+            if saved_theme in {"default", "terminal", "cyberpunk"}:
+                settings.isa_theme = saved_theme
+        except Exception:
+            pass
+    return settings

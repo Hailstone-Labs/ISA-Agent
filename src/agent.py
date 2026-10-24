@@ -26,7 +26,9 @@ from src.monitor.observer import (
     RESPONSE_END_MARKER,
     THINKING_START_MARKER,
     extract_inline_note_command,
+    is_fast_command_str,
 )
+from src.theme import ensure_obsidian_themes_snippet, get_theme
 from src.tools.calendar import (
     CalendarEventSpec,
     cancel_vault_calendar_event,
@@ -106,17 +108,21 @@ def build_local_model(settings: ISASettings | None = None) -> OpenAIChatModel:
 def format_thinking_block(
     command: str,
     status_line: str = "Analyzing request with local Gemma 4 12B...",
+    theme_name: str | None = None,
 ) -> str:
     """Format an in-place 'ISA is thinking...' callout block for Obsidian."""
+    theme = get_theme(theme_name)
     ts = datetime.now().strftime("%H:%M:%S")
     preview = command.replace("\n", " ").strip()
     if len(preview) > 80:
         preview = preview[:77] + "..."
+    translated_status = theme.translate_status_message(status_line)
+    header = theme.format_thinking_header(ts)
     return (
         f"\n\n{THINKING_START_MARKER}\n"
-        f"> [!WARNING] ⏳ ISA is thinking... ({ts})\n"
-        f"> **Prompt:** *{preview}*\n"
-        f"> **Status:** {status_line}\n"
+        f"> [!{theme.callout_thinking_tag}] {header}\n"
+        f"> {theme.prompt_label} *{preview}*\n"
+        f"> {theme.status_label} {translated_status}\n"
         f"{THINKING_END_MARKER}\n"
     )
 
@@ -128,7 +134,11 @@ async def _update_thinking_status(deps: ISADependencies, status_line: str) -> No
     async with deps.inbox_lock:
         try:
             current = await deps.obsidian.get_note(deps.settings.inbox_filename)
-            new_block = format_thinking_block(deps.active_command, status_line)
+            new_block = format_thinking_block(
+                command=deps.active_command,
+                status_line=status_line,
+                theme_name=deps.settings.isa_theme,
+            )
             if THINKING_START_MARKER in current:
                 updated = THINKING_BLOCK_REGEX.sub(new_block, current)
                 await deps.obsidian.create_or_overwrite_note(
@@ -194,6 +204,11 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         if ctx.deps.context_window is None:
             return ""
         return ctx.deps.context_window.format_for_system_prompt()
+
+    @agent.system_prompt
+    def inject_theme_voice(ctx: RunContext[ISADependencies]) -> str:
+        theme = get_theme(ctx.deps.settings.isa_theme)
+        return theme.system_prompt_addon
 
     @agent.tool
     async def search_vault(ctx: RunContext[ISADependencies], query: str) -> str:
@@ -751,6 +766,7 @@ def format_inbox_response(
     response_text: str,
     timestamp: datetime | None = None,
     include_next_prompt_stub: bool = True,
+    theme_name: str | None = None,
 ) -> str:
     """Format an ISA response block with strict Obsidian callout separation and a ready-to-type prompt stub.
 
@@ -758,6 +774,7 @@ def format_inbox_response(
     so Obsidian's Live Preview CodeMirror 6 engine fully renders and collapses the callout.
     Appends an empty '@ISA ' line with a Templater cursor tag well below the response.
     """
+    theme = get_theme(theme_name)
     ts = (timestamp or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     cleaned = response_text.strip()
     blockquote_lines = "\n".join(
@@ -765,8 +782,9 @@ def format_inbox_response(
     )
 
     stub = f"\n\n---\n\n@ISA {CURSOR_PLACEHOLDER}\n" if include_next_prompt_stub else "\n"
+    header = theme.format_response_header(ts)
     return (
-        f"\n\n> [!NOTE] ISA Response ({ts})\n"
+        f"\n\n> [!{theme.callout_response_tag}] {header}\n"
         f"{blockquote_lines}\n\n"
         f"{RESPONSE_END_MARKER}"
         f"{stub}"
@@ -791,11 +809,68 @@ async def dispatch_inbox_command(
             persist_path=deps.settings.context_window_path,
         )
 
-    # Fast-path for deterministic commands like /rescan, /briefing, and /archive
+    # Fast-path for deterministic commands like /rescan, /briefing, /archive, /clear, and /theme
     clean_cmd = command.strip().lower()
-    if clean_cmd in FAST_COMMANDS:
+    if clean_cmd in FAST_COMMANDS or clean_cmd.startswith(("/theme", "theme")):
         logger.info("Executing fast-path command: %s", clean_cmd)
-        if clean_cmd in {"/briefing", "briefing"}:
+        if clean_cmd.startswith(("/theme", "theme")):
+            parts = clean_cmd.split(maxsplit=1)
+            req_theme_arg = parts[1].strip() if len(parts) > 1 else ""
+            if not req_theme_arg:
+                curr_theme = deps.settings.isa_theme
+                reply_text = (
+                    f"🎨 **Active ISA Theme:** `{curr_theme}`\n\n"
+                    "**Available Themes:**\n"
+                    "- `default`  : Clean executive minimalist styling\n"
+                    "- `terminal` : Old school black/green phosphor CRT terminal with raster scanlines\n"
+                    "- `cyberpunk`: Night City Netrunner Relic HUD with cyan/yellow/pink neon\n\n"
+                    "To switch themes, type `@ISA /theme <name>` (e.g. `@ISA /theme terminal` or `@ISA /theme cyberpunk`)."
+                )
+            else:
+                target_cfg = get_theme(req_theme_arg)
+                deps.settings.isa_theme = target_cfg.name
+                try:
+                    deps.settings.theme_persist_path.parent.mkdir(parents=True, exist_ok=True)
+                    deps.settings.theme_persist_path.write_text(target_cfg.name, encoding="utf-8")
+                except Exception as exc:
+                    logger.debug("Could not persist theme to disk: %s", exc)
+
+                try:
+                    ensure_obsidian_themes_snippet(deps.settings.obsidian_vault_path)
+                except Exception as exc:
+                    logger.debug("Could not write obsidian theme snippet: %s", exc)
+
+                send_macos_notification(
+                    title="ISA Theme Switched",
+                    subtitle=f"Active: {target_cfg.name.upper()}",
+                    message="Theme updated successfully in Obsidian.",
+                )
+
+                if target_cfg.name == "terminal":
+                    reply_text = (
+                        "📟 **[SYS_INIT] // CRT TERMINAL THEME ACTIVATED**\n\n"
+                        "- **DISPLAY_MODE:** Phosphor Green (#00FF66) / Deep Black (#030804)\n"
+                        "- **EFFECTS:** CRT Raster Scanlines + Glow Box-Shadow\n"
+                        "- **OPERATOR_VOICE:** Unix Mainframe Kernel Operator\n"
+                        "- **CONFIG:** Persisted to `data/isa_theme.txt`"
+                    )
+                elif target_cfg.name == "cyberpunk":
+                    reply_text = (
+                        "⚡ **[RELIC_LINK: SYNCED] // NIGHT CITY NETRUNNER THEME ACTIVATED**\n\n"
+                        "- **INTERFACE:** Cyberpunk 2077 Relic HUD / Militech Sub-Net\n"
+                        "- **PALETTE:** Glitch Cyan (#00F0FF) / Neon Yellow (#FCEE0A) / Trauma Crimson (#FF003C)\n"
+                        "- **VOICE DIRECTIVE:** Night City Netrunner Companion\n"
+                        "- **STATUS:** Jacked in, Choom. Ready for the next gig."
+                    )
+                else:
+                    reply_text = (
+                        "👔 **Default Executive Theme Restored**\n\n"
+                        "- **Style:** Minimalist Obsidian Callout\n"
+                        "- **Voice:** Executive Secretary Assistant\n"
+                        "- **Status:** Ready for instructions."
+                    )
+            tool_note = f"Fast-path /theme: set to {deps.settings.isa_theme}"
+        elif clean_cmd in {"/briefing", "briefing"}:
             saved_path, briefing_md = await generate_daily_executive_briefing(
                 obsidian=deps.obsidian,
                 vault_root=deps.settings.obsidian_vault_path,
@@ -856,7 +931,11 @@ async def dispatch_inbox_command(
             )
             tool_note = f"Fast-path /rescan: indexed {count} chunks"
 
-        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
+        formatted_block = format_inbox_response(
+            reply_text,
+            include_next_prompt_stub=True,
+            theme_name=deps.settings.isa_theme,
+        )
         deps.context_window.add_entry(
             user_prompt=command,
             assistant_response=reply_text,
@@ -912,7 +991,11 @@ async def dispatch_inbox_command(
             message_history=history_messages if history_messages else None,
         )
         reply_text = result.output
-        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
+        formatted_block = format_inbox_response(
+            reply_text,
+            include_next_prompt_stub=True,
+            theme_name=deps.settings.isa_theme,
+        )
         deps.context_window.add_entry(
             user_prompt=command,
             assistant_response=reply_text,
@@ -921,7 +1004,11 @@ async def dispatch_inbox_command(
     except Exception as exc:
         logger.exception("Error during LLM execution: %s", exc)
         reply_text = f"Error processing request: `{exc}`"
-        formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
+        formatted_block = format_inbox_response(
+            reply_text,
+            include_next_prompt_stub=True,
+            theme_name=deps.settings.isa_theme,
+        )
 
     async with deps.inbox_lock:
         current = await deps.obsidian.get_note(deps.settings.inbox_filename)
@@ -957,13 +1044,15 @@ def format_inline_note_response(
     command: str,
     response_text: str,
     timestamp: datetime | None = None,
+    theme_name: str | None = None,
 ) -> str:
     """Format an inline ISA callout block that replaces an `@ISA <command>` line inside any vault note.
 
-    Replaces the raw `@ISA` trigger prefix with a `> [!NOTE] 🤖 ISA` callout header so the
+    Replaces the raw `@ISA` trigger prefix with a themed callout header so the
     note never re-triggers, and converts any `- [ ]` checkboxes inside the callout to `- •`
     so Obsidian Tasks does not double-index tasks alongside Tasks.md.
     """
+    theme = get_theme(theme_name)
     ts = (timestamp or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     sanitized_body = re.sub(
         r"^(\s*-\s*)\[[ xX]\]\s+",
@@ -974,9 +1063,9 @@ def format_inline_note_response(
     blockquote_lines = "\n".join(
         f"> {line}" if line else ">" for line in sanitized_body.splitlines()
     )
-    preview_cmd = command.replace("\n", " ").strip()
+    header = theme.format_inline_header(command, ts)
     return (
-        f"> [!NOTE] 🤖 ISA (`{preview_cmd}`) — {ts}\n"
+        f"{header}\n"
         f"{blockquote_lines}\n"
     )
 
@@ -1048,7 +1137,11 @@ async def dispatch_inline_note_command(
     finally:
         deps.active_inline_note = None
 
-    callout_block = format_inline_note_response(command, reply_text)
+    callout_block = format_inline_note_response(
+        command=command,
+        response_text=reply_text,
+        theme_name=deps.settings.isa_theme,
+    )
 
     # Re-read the note in case an agent tool (e.g. extract_meeting_action_items) updated it during the run
     try:

@@ -28,7 +28,15 @@ FAST_COMMANDS = {
     "clear",
     "/clear-inbox",
     "clear-inbox",
+    "/theme",
+    "theme",
 }
+
+
+def is_fast_command_str(cmd: str) -> bool:
+    """Return True if command is a recognized slash command or theme switch."""
+    low = cmd.strip().lower()
+    return low in FAST_COMMANDS or low.startswith(("/theme ", "theme "))
 
 
 def extract_pending_command(
@@ -82,15 +90,15 @@ def extract_pending_command(
         after_command_idx = raw_after_trigger.find(command) + len(command)
         trailing_whitespace = raw_after_trigger[after_command_idx:]
         has_blank_line_after = "\n\n" in trailing_whitespace or "\r\n\r\n" in trailing_whitespace
-        is_fast_command = command.lower() in FAST_COMMANDS
+        is_fast_cmd = is_fast_command_str(command)
 
         if manual_trigger_only:
             # Manual mode: MUST press Enter twice (blank line after prompt) or run a fast command
-            if not (has_blank_line_after or is_fast_command):
+            if not (has_blank_line_after or is_fast_cmd):
                 return None
         else:
             ends_with_punctuation = command.endswith(COMPLETE_SENTENCE_ENDINGS)
-            if not (has_blank_line_after or ends_with_punctuation or is_fast_command):
+            if not (has_blank_line_after or ends_with_punctuation or is_fast_cmd):
                 return None
 
     return command
@@ -130,14 +138,14 @@ def extract_inline_note_command(
 
         blank_line_match = re.match(r"^\r?\n[ \t]*\r?\n", after_line)
         has_blank_line = blank_line_match is not None
-        is_fast_command = raw_cmd.lower() in FAST_COMMANDS
+        is_fast_cmd = is_fast_command_str(raw_cmd)
 
         if manual_trigger_only:
-            if not (has_blank_line or is_fast_command):
+            if not (has_blank_line or is_fast_cmd):
                 continue
         else:
             ends_with_punct = raw_cmd.endswith(COMPLETE_SENTENCE_ENDINGS)
-            if not (has_blank_line or ends_with_punct or is_fast_command):
+            if not (has_blank_line or ends_with_punct or is_fast_cmd):
                 continue
 
         return (raw_cmd, match.start(), match.end())

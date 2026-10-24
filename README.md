@@ -206,13 +206,30 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 
 #### G. Instant Fast-Path Slash Commands (`< 1s`, No LLM Latency)
 ```markdown
-@ISA /briefing   # Generates Briefings/YYYY-MM-DD - Executive Briefing.md combining today's events, tasks, and recent meetings
-@ISA /archive    # Archives older ISA_Inbox.md exchanges into Archive/ISA_Transcript_YYYY-MM.md (keeping the last 2 visible)
-@ISA /clear      # Wipes ISA_Inbox.md back to a completely clean slate with a fresh @ISA prompt line
-@ISA /rescan     # Forces a full vault LanceDB re-index with macOS desktop notification
+@ISA /briefing        # Generates Briefings/YYYY-MM-DD - Executive Briefing.md combining today's events, tasks, and recent meetings
+@ISA /archive         # Archives older ISA_Inbox.md exchanges into Archive/ISA_Transcript_YYYY-MM.md (keeping the last 2 visible)
+@ISA /clear           # Wipes ISA_Inbox.md back to a completely clean slate with a fresh @ISA prompt line
+@ISA /rescan          # Forces a full vault LanceDB re-index with macOS desktop notification
+@ISA /theme <name>    # Switches theme on-the-fly: 'default', 'terminal', or 'cyberpunk'
 ```
 
-#### H. Meeting Action-Item Extraction & Inline `@ISA` Anywhere in the Vault
+#### H. Response & Status Themes (Default, Retro CRT Terminal, Cyberpunk 2077)
+Switch themes anytime using `@ISA /theme <name>` in `ISA_Inbox.md` or via `ISA_THEME` in `.env` / `--theme` CLI flag:
+- **👔 `default` (Executive Minimalist)**:
+  - Clean native Obsidian callouts (`> [!NOTE]` & `> [!WARNING]`).
+  - Professional, concise administrative secretary tone.
+- **📟 `terminal` (Retro CRT Phosphor Green)**:
+  - Deep black background (`#030804`), vintage glowing green phosphor (`#00ff66`), monospace font (`JetBrains Mono`/`Courier New`), scanlines, and green glow box-shadow.
+  - Live status indicator: `> [!isa-terminal-thinking] 📟 [TTY1] // ISA_KERNEL v2.4 (HH:MM:SS)`.
+  - Final response callout: `> [!isa-terminal] 📟 [SYS_OK] // EXECUTION COMPLETE`.
+  - Voice: Unix mainframe kernel operator / terminal daemon.
+- **⚡ `cyberpunk` (Cyberpunk 2077 / Night City Netrunner Relic HUD)**:
+  - Cyber dark background (`#0b0b14`), electric yellow (`#fcee0a`), glitch cyan (`#00f0ff`), neon crimson (`#ff003c`), angled chamfered HUD clip-path corners, and dual-glow borders.
+  - Live status indicator: `> [!isa-cyberpunk-thinking] ⚡ [NETRUNNER ICE BREAKER] // RELIC HUD (HH:MM:SS)`.
+  - Final response callout: `> [!isa-cyberpunk] ⚡ [RELIC_LINK: ACTIVE] // NIGHT CITY INTEL FEED`.
+  - Voice: Night City Netrunner companion (*Choom*, *ICE*, *chrome*, *sub-net*, *Kiroshi scans*).
+
+#### I. Meeting Action-Item Extraction & Inline `@ISA` Anywhere in the Vault
 - **Meeting Action-Item Extraction (`extract_meeting_action_items`)**:
   ```markdown
   @ISA Extract the action items from Meetings/Q4 Product Sync.md and add them to my task list.

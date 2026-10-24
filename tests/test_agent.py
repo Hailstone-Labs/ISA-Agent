@@ -5,7 +5,16 @@ from __future__ import annotations
 import os
 import pytest
 from config.settings import ISASettings, enforce_airgap_env
-from src.agent import build_isa_agent, build_local_model, format_inbox_response
+from src.theme import ensure_obsidian_themes_snippet, get_theme
+from src.agent import (
+    ISADependencies,
+    build_isa_agent,
+    build_local_model,
+    dispatch_inbox_command,
+    format_inbox_response,
+    format_inline_note_response,
+    format_thinking_block,
+)
 from src.memory.context_window import RollingContextWindow, parse_inbox_entries
 from src.memory.ingest import MarkdownHeaderTextSplitter
 from src.memory.vector_db import (
@@ -282,3 +291,112 @@ def test_wikilink_one_hop_graph_traversal_in_hybrid_search(tmp_path) -> None:
     graph_hits = [h for h in hits if h.get("matched_graph")]
     assert len(graph_hits) == 1
     assert graph_hits[0]["file_path"] == "Vendor_Contract_Delta.md"
+
+
+def test_theme_system_formatting_and_css_snippet(tmp_path) -> None:
+    # 1. Theme resolution & aliases
+    t_def = get_theme("default")
+    assert t_def.name == "default"
+    assert t_def.callout_response_tag == "NOTE"
+
+    t_term = get_theme("matrix")
+    assert t_term.name == "terminal"
+    assert t_term.callout_response_tag == "isa-terminal"
+    assert t_term.callout_thinking_tag == "isa-terminal-thinking"
+
+    t_cyber = get_theme("2077")
+    assert t_cyber.name == "cyberpunk"
+    assert t_cyber.callout_response_tag == "isa-cyberpunk"
+    assert t_cyber.callout_thinking_tag == "isa-cyberpunk-thinking"
+
+    # 2. Status message translations
+    assert "[LANCE_RRF]" in t_term.translate_status_message("Searching vault memory for 'notes'")
+    assert "JACKING IN" in t_cyber.translate_status_message("Searching vault memory for 'notes'")
+
+    # 3. Thinking block rendering
+    thinking_term = format_thinking_block("Inspect servers", status_line="Checking status", theme_name="terminal")
+    assert "> [!isa-terminal-thinking]" in thinking_term
+    assert "ISA_KERNEL" in thinking_term
+    assert "**EXEC_IN:**" in thinking_term
+
+    thinking_cyber = format_thinking_block("Hack Arasaka", status_line="Scanning", theme_name="cyberpunk")
+    assert "> [!isa-cyberpunk-thinking]" in thinking_cyber
+    assert "RELIC HUD" in thinking_cyber
+    assert "**TARGET_INTEL:**" in thinking_cyber
+
+    # 4. Response callout formatting
+    resp_term = format_inbox_response("Kernel panic: false", theme_name="terminal")
+    assert "> [!isa-terminal]" in resp_term
+    assert "[SYS_OK]" in resp_term
+
+    resp_cyber = format_inbox_response("Gig completed, choom.", theme_name="cyberpunk")
+    assert "> [!isa-cyberpunk]" in resp_cyber
+    assert "NIGHT CITY INTEL FEED" in resp_cyber
+
+    # 5. Inline response formatting
+    inline_cyber = format_inline_note_response("Sync shard", "- [ ] Review eddies", theme_name="cyberpunk")
+    assert "> [!isa-cyberpunk]" in inline_cyber
+    assert "CHROME_FEED" in inline_cyber
+    assert "- [ ]" not in inline_cyber
+    assert "> - • Review eddies" in inline_cyber
+
+    # 6. Obsidian CSS snippet installation & appearance.json registration
+    css_path = ensure_obsidian_themes_snippet(tmp_path)
+    assert css_path.exists()
+    assert "isa-terminal" in css_path.read_text(encoding="utf-8")
+    assert "isa-cyberpunk" in css_path.read_text(encoding="utf-8")
+    app_json = tmp_path / ".obsidian" / "appearance.json"
+    assert app_json.exists()
+    assert "isa-themes" in app_json.read_text(encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_theme_slash_command_switching(tmp_path) -> None:
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    inbox_file = vault_dir / "ISA_Inbox.md"
+    inbox_file.write_text("# ISA Inbox\n\n@ISA /theme cyberpunk\n", encoding="utf-8")
+
+    class DummyClient:
+        def __init__(self, root):
+            self.root = root
+
+        async def get_note(self, path: str) -> str:
+            p = self.root / path.lstrip("/")
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        async def create_or_overwrite_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        async def append_to_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            existing = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(existing + content, encoding="utf-8")
+
+        async def execute_command(self, cmd: str) -> None:
+            pass
+
+    settings = ISASettings(
+        OBSIDIAN_VAULT_PATH=vault_dir,
+        LANCEDB_URI=tmp_path / "lancedb",
+        ISA_THEME="default",
+    )
+    deps = ISADependencies(
+        settings=settings,
+        obsidian=DummyClient(vault_dir),
+    )
+
+    reply = await dispatch_inbox_command(command="/theme cyberpunk", deps=deps)
+    assert "NIGHT CITY NETRUNNER THEME ACTIVATED" in reply
+    assert deps.settings.isa_theme == "cyberpunk"
+    assert (tmp_path / "isa_theme.txt").read_text(encoding="utf-8") == "cyberpunk"
+    written_inbox = await deps.obsidian.get_note("ISA_Inbox.md")
+    assert "> [!isa-cyberpunk]" in written_inbox
+
+    # Switch to terminal
+    reply_term = await dispatch_inbox_command(command="/theme terminal", deps=deps)
+    assert "CRT TERMINAL THEME ACTIVATED" in reply_term
+    assert deps.settings.isa_theme == "terminal"
+    assert (tmp_path / "isa_theme.txt").read_text(encoding="utf-8") == "terminal"

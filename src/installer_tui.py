@@ -272,6 +272,12 @@ def scaffold_vault_files(vault_path: Path) -> None:
             encoding="utf-8",
         )
 
+    try:
+        from src.theme import ensure_obsidian_themes_snippet
+        ensure_obsidian_themes_snippet(vault_path)
+    except Exception:
+        pass
+
 
 def write_env_file(
     project_root: Path,

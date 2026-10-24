@@ -28,6 +28,7 @@ from src.memory.vector_db import (
     sync_single_vault_file_to_lancedb,
 )
 from src.monitor.observer import create_inbox_observer, extract_pending_command
+from src.theme import ensure_obsidian_themes_snippet, get_theme
 from src.tools.documents import generate_daily_executive_briefing
 from src.tools.notifications import ActiveReminderMonitor
 from src.tools.obsidian import ObsidianRestClient
@@ -268,6 +269,12 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     vector_store = LocalVectorStore(settings)
     embedder = LocalEmbedder(settings)
 
+    # Ensure Obsidian custom theme snippet is installed and active in the vault
+    try:
+        ensure_obsidian_themes_snippet(settings.obsidian_vault_path)
+    except Exception as exc:
+        logger.debug("Could not ensure obsidian theme snippet: %s", exc)
+
     # Index the vault on startup so Hybrid RAG is immediately ready
     ingest_vault_to_lancedb(
         settings=settings,
@@ -417,10 +424,11 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     observer.start()
     mode_desc = "MANUAL (Single Enter / newline; punctuation ignored)" if settings.manual_trigger_only else "AUTO (Punctuation [.!?] + Enter OR Enter twice)"
     logger.info(
-        "Watchdog daemon monitoring %s (debounce=%.2fs, mode=%s). Waiting for @ISA commands...",
+        "Watchdog daemon monitoring %s (debounce=%.2fs, mode=%s, theme=%s). Waiting for @ISA commands...",
         settings.inbox_path,
         settings.debounce_seconds,
         mode_desc,
+        settings.isa_theme.upper(),
     )
 
     if settings.inbox_path.exists():
@@ -539,7 +547,15 @@ def main() -> int:
         action="store_true",
         help="Trigger on terminal punctuation (.!?) + Enter or pressing Enter twice.",
     )
+    parser.add_argument(
+        "--theme",
+        choices=["default", "terminal", "cyberpunk"],
+        help="Select visual & persona theme ('default', 'terminal', 'cyberpunk').",
+    )
     args = parser.parse_args()
+
+    if args.theme:
+        os.environ["ISA_THEME"] = args.theme
 
     if args.manual_trigger:
         os.environ["ISA_MANUAL_TRIGGER_ONLY"] = "true"
