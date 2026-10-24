@@ -171,3 +171,31 @@ class ActiveReminderMonitor:
             fired += 1
 
         return fired
+
+    def should_trigger_morning_briefing(
+        self,
+        target_time_hhmm: str = "08:00",
+        now: datetime | None = None,
+    ) -> bool:
+        """Return True once per day when current local time >= target_time_hhmm and today's briefing doesn't exist yet."""
+        clean_time = target_time_hhmm.strip()
+        if not clean_time or not re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", clean_time):
+            return False
+
+        current_dt = now or datetime.now()
+        today_str = current_dt.strftime("%Y-%m-%d")
+        key = f"briefing::{today_str}"
+        if key in self._notified_keys:
+            return False
+
+        briefing_file = self.vault_path / "Briefings" / f"{today_str} - Executive Briefing.md"
+        if briefing_file.exists():
+            self._notified_keys.add(key)
+            return False
+
+        current_hhmm = current_dt.strftime("%H:%M")
+        if current_hhmm >= clean_time:
+            self._notified_keys.add(key)
+            return True
+
+        return False

@@ -19,6 +19,17 @@ from src.memory.ingest import (
 logger = logging.getLogger("isa.memory.vector_db")
 
 TOKEN_REGEX = re.compile(r"\w+", re.UNICODE)
+WIKILINK_REGEX = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+
+
+def extract_wikilinks(text: str) -> list[str]:
+    """Extract unique Obsidian [[WikiLink]] target note names/paths from Markdown text."""
+    seen: list[str] = []
+    for match in WIKILINK_REGEX.finditer(text):
+        target = match.group(1).strip()
+        if target and target not in seen:
+            seen.append(target)
+    return seen
 
 
 def tokenize_for_bm25(text: str) -> list[str]:
@@ -157,8 +168,9 @@ class LocalVectorStore:
         embedder: EmbedderProtocol,
         limit: int = 5,
         rrf_k: int | None = None,
+        expand_wikilinks: bool = True,
     ) -> list[dict]:
-        """Execute Hybrid Search (Dense Vector + BM25) fused with Reciprocal Rank Fusion (RRF)."""
+        """Execute Hybrid Search (Dense Vector + BM25) fused with RRF and optional 1-hop [[WikiLink]] graph traversal."""
         if self.TABLE_NAME not in self.list_tables():
             return []
 
@@ -185,12 +197,47 @@ class LocalVectorStore:
 
         fused = reciprocal_rank_fusion([dense_ids, bm25_ids], k=k_val)
         results: list[dict] = []
+        seen_chunk_ids: set[str] = set()
         for cid, rrf_score in fused[:limit]:
             doc = dict(chunk_lookup[cid])
             doc["rrf_score"] = rrf_score
             doc["matched_dense"] = cid in dense_ids
             doc["matched_bm25"] = cid in bm25_ids
+            doc["matched_graph"] = False
             results.append(doc)
+            seen_chunk_ids.add(cid)
+
+        if expand_wikilinks and results:
+            all_chunks = self.get_all_chunks()
+            linked_targets: list[str] = []
+            top_stems: set[str] = set()
+            for r in results:
+                top_stems.add(Path(r["file_path"]).stem.lower())
+                for link in extract_wikilinks(r["text"]):
+                    link_low = Path(link).stem.lower()
+                    if link_low not in linked_targets:
+                        linked_targets.append(link_low)
+
+            graph_neighbors: list[dict] = []
+            for chunk in all_chunks:
+                cid = chunk["chunk_id"]
+                if cid in seen_chunk_ids:
+                    continue
+                c_stem = Path(chunk["file_path"]).stem.lower()
+                c_links = {Path(wl).stem.lower() for wl in extract_wikilinks(chunk["text"])}
+                # Outgoing link from a top hit OR incoming backlink to a top hit
+                if c_stem in linked_targets or bool(c_links.intersection(top_stems)):
+                    neighbor = dict(chunk)
+                    neighbor["rrf_score"] = 0.005
+                    neighbor["matched_dense"] = False
+                    neighbor["matched_bm25"] = False
+                    neighbor["matched_graph"] = True
+                    graph_neighbors.append(neighbor)
+                    seen_chunk_ids.add(cid)
+                    if len(graph_neighbors) >= 3:
+                        break
+            results.extend(graph_neighbors)
+
         return results
 
 

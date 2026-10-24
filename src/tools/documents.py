@@ -11,7 +11,7 @@ from src.monitor.observer import CURSOR_PLACEHOLDER, RESPONSE_END_MARKER
 from src.tools.calendar import list_vault_calendar_events
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import ObsidianRestClient
-from src.tools.tasks import list_vault_tasks
+from src.tools.tasks import TaskSpec, append_vault_task, list_vault_tasks
 
 OUTER_MARKDOWN_FENCE_RE = re.compile(
     r"^\s*```(?:markdown|md|yaml)?\s*\n(.*?)\n```\s*$",
@@ -381,3 +381,163 @@ async def clear_inbox_page(
             message="Inbox page reset to a clean slate.",
         )
     return clean_slate
+
+
+ACTION_ITEM_PREFIX_RE = re.compile(
+    r"^\s*(?:[-*]\s*(?:\[\s*\]\s*)?)?(?:ACTION(?:\s+ITEM)?|TODO|TASK|NEXT\s+STEP|FOLLOW[- ]?UP)\s*[:\-—]\s*(.+)$",
+    re.IGNORECASE,
+)
+ACTION_VERB_BULLET_RE = re.compile(
+    r"^\s*[-*]\s+(?:\[\s*\]\s*)?((?:review|send|schedule|draft|prepare|submit|call|email|update|create|follow\s+up|finalize|complete|check|share|sync|organize|confirm|investigate|write)\b.+)$",
+    re.IGNORECASE,
+)
+UNCHECKED_BOX_RE = re.compile(r"^\s*-\s*\[\s\]\s+(.+)$")
+
+
+def parse_action_items_from_markdown(markdown_text: str) -> list[str]:
+    """Deterministically extract actionable items from meeting notes or discussion bullets."""
+    extracted: list[str] = []
+    seen_low: set[str] = set()
+
+    def _add(item_str: str) -> None:
+        cleaned = re.sub(r"^-\s*\[[ xX]\]\s*", "", item_str.strip()).strip()
+        if not cleaned:
+            return
+        low = cleaned.lower()
+        if low not in seen_low:
+            seen_low.add(low)
+            extracted.append(cleaned)
+
+    in_action_section = False
+    for raw_line in markdown_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(">") or re.match(r"^(?:[-*]\s*)?@ISA\b", stripped, re.IGNORECASE):
+            continue
+        if stripped.startswith("#"):
+            heading_low = stripped.lstrip("#").strip().lower()
+            in_action_section = any(
+                kw in heading_low
+                for kw in ("action item", "next step", "todo", "to-do", "deliverable")
+            )
+            continue
+
+        m_prefix = ACTION_ITEM_PREFIX_RE.match(stripped)
+        if m_prefix:
+            _add(m_prefix.group(1))
+            continue
+
+        m_box = UNCHECKED_BOX_RE.match(stripped)
+        if m_box:
+            _add(m_box.group(1))
+            continue
+
+        if in_action_section and stripped.startswith(("-", "*")):
+            bullet_text = re.sub(r"^[-*]\s*(?:•\s*)?", "", stripped).strip()
+            if bullet_text:
+                _add(bullet_text)
+            continue
+
+        m_verb = ACTION_VERB_BULLET_RE.match(stripped)
+        if m_verb:
+            _add(m_verb.group(1))
+
+    return extracted
+
+
+async def sync_meeting_action_items(
+    obsidian: ObsidianRestClient,
+    vault_root: Path,
+    note_query: str,
+    explicit_items: list[str] | None = None,
+    due_date: str | None = None,
+    default_due_date: str | None = None,
+    tasks_filename: str = "Tasks.md",
+    notify: bool = True,
+) -> tuple[str, list[str], int]:
+    """Extract or record action items in a meeting note and sync them to Tasks.md without duplicates.
+
+    Notice that inside the meeting note itself, action items are formatted as `- •` bullets
+    (and synced into Tasks.md as `- [ ]`) so Obsidian Tasks never double-counts the same item
+    from both the meeting note and Tasks.md.
+    """
+    resolved_due = due_date or default_due_date
+    clean_q = note_query.strip().lstrip("/")
+    candidates: list[Path] = []
+    direct = vault_root / (clean_q if clean_q.endswith(".md") else f"{clean_q}.md")
+    if direct.exists():
+        candidates.append(direct)
+    else:
+        q_low = Path(clean_q).stem.lower()
+        for p in sorted(vault_root.rglob("*.md")):
+            if any(part.startswith(".") for part in p.relative_to(vault_root).parts):
+                continue
+            if q_low in p.stem.lower():
+                candidates.append(p)
+
+    if not candidates:
+        raise ValueError(f"No meeting note matched '{note_query}'.")
+
+    target_file = candidates[0]
+    rel_path = str(target_file.relative_to(vault_root))
+    note_content = await obsidian.get_note(rel_path)
+
+    items = [i.strip() for i in (explicit_items or []) if i and i.strip()]
+    if not items:
+        items = parse_action_items_from_markdown(note_content)
+
+    if not items:
+        return rel_path, [], 0
+
+    added_lines: list[str] = []
+    skipped_count = 0
+    for desc in items:
+        clean_desc = re.sub(r"^-\s*(?:\[[ xX]\]|•)\s*", "", desc).strip()
+        spec = TaskSpec(
+            description=f"{clean_desc} (from [[{target_file.stem}]])"
+            if f"[[{target_file.stem}]]" not in clean_desc
+            else clean_desc,
+            due_date=resolved_due,
+        )
+        task_line, created_new = await append_vault_task(
+            obsidian=obsidian,
+            task=spec,
+            tasks_filename=tasks_filename,
+            notify=False,
+        )
+        if created_new:
+            added_lines.append(task_line)
+        else:
+            skipped_count += 1
+
+    # Convert any raw `- [ ]` lines in the meeting note to `- •` and update '## ⚡ Action Items'
+    # so Obsidian Tasks only indexes the single canonical entry in Tasks.md
+    sanitized_note = re.sub(
+        r"^(\s*-\s*)\[\s\]\s+",
+        r"\1• ",
+        note_content,
+        flags=re.MULTILINE,
+    )
+    bullet_prefix_re = re.compile(r"^-\s*(?:\[[ xX]\]|•)\s*")
+    bullet_block = "\n".join(
+        f"- • {bullet_prefix_re.sub('', i).strip()}" for i in items
+    )
+    if re.search(r"^##+\s*.*Action Items.*$", sanitized_note, flags=re.IGNORECASE | re.MULTILINE):
+        updated_note = re.sub(
+            r"(^##+\s*.*Action Items.*$\n?)(?:[\s\S]*?)(?=\n##+\s|\n@ISA\b|\n>\s*\[!NOTE\]|\Z)",
+            r"\1" + bullet_block + "\n",
+            sanitized_note,
+            count=1,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+    else:
+        updated_note = sanitized_note.rstrip() + f"\n\n## ⚡ Action Items\n{bullet_block}\n"
+
+    await obsidian.create_or_overwrite_note(rel_path, updated_note)
+
+    if notify and added_lines:
+        send_macos_notification(
+            title="ISA Action Items Synced",
+            subtitle=target_file.stem,
+            message=f"Added {len(added_lines)} new task(s) to {tasks_filename}",
+        )
+    return rel_path, added_lines, skipped_count

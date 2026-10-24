@@ -8,12 +8,18 @@ from datetime import datetime
 import fcntl
 import logging
 import os
+from pathlib import Path
 import resource
 import signal
 import time
 import httpx
 from config.settings import enforce_airgap_env, get_settings
-from src.agent import ISADependencies, build_isa_agent, dispatch_inbox_command
+from src.agent import (
+    ISADependencies,
+    build_isa_agent,
+    dispatch_inbox_command,
+    dispatch_inline_note_command,
+)
 from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import LocalEmbedder
 from src.memory.vector_db import (
@@ -22,6 +28,7 @@ from src.memory.vector_db import (
     sync_single_vault_file_to_lancedb,
 )
 from src.monitor.observer import create_inbox_observer, extract_pending_command
+from src.tools.documents import generate_daily_executive_briefing
 from src.tools.notifications import ActiveReminderMonitor
 from src.tools.obsidian import ObsidianRestClient
 
@@ -308,6 +315,26 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
         while not stop_event.is_set():
             try:
                 reminder_monitor.check_and_notify()
+                if reminder_monitor.should_trigger_morning_briefing(
+                    settings.morning_briefing_time
+                ):
+                    saved_rel, _ = await generate_daily_executive_briefing(
+                        obsidian=obsidian,
+                        vault_root=settings.obsidian_vault_path,
+                        calendar_folder=settings.calendar_folder,
+                        tasks_filename=settings.active_tasks_filename,
+                        notify=True,
+                    )
+                    sync_single_vault_file_to_lancedb(
+                        file_path=settings.obsidian_vault_path / saved_rel,
+                        settings=settings,
+                        embedder=embedder,
+                        vector_store=vector_store,
+                    )
+                    logger.info(
+                        "Scheduled morning executive briefing auto-generated at %s",
+                        saved_rel,
+                    )
             except Exception as exc:
                 logger.debug("Reminder scan error: %s", exc)
             try:
@@ -355,6 +382,29 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
 
         loop.call_soon_threadsafe(asyncio.create_task, _debounced_reindex())
 
+    inline_dispatch_lock = asyncio.Lock()
+
+    def on_inline_command_detected(note_path: Path, cmd: str) -> None:
+        async def _debounced_inline_dispatch() -> None:
+            await asyncio.sleep(2.5)
+            async with inline_dispatch_lock:
+                try:
+                    await dispatch_inline_note_command(
+                        note_path=note_path,
+                        command=cmd,
+                        deps=deps,
+                        handler=handler,
+                        agent=agent,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Error processing inline @ISA command in %s: %s",
+                        note_path,
+                        exc,
+                    )
+
+        loop.call_soon_threadsafe(asyncio.create_task, _debounced_inline_dispatch())
+
     observer, handler = create_inbox_observer(
         inbox_path=settings.inbox_path,
         on_user_command=on_command_detected,
@@ -362,6 +412,7 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
         require_newline=True,
         manual_trigger_only=settings.manual_trigger_only,
         on_vault_change=on_vault_file_changed,
+        on_inline_command=on_inline_command_detected,
     )
     observer.start()
     mode_desc = "MANUAL (Single Enter / newline; punctuation ignored)" if settings.manual_trigger_only else "AUTO (Punctuation [.!?] + Enter OR Enter twice)"

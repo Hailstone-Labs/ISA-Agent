@@ -293,6 +293,36 @@ def test_calendar_listing_and_cancellation(tmp_path) -> None:
     assert events[0]["date"] == "2026-10-25"
 
 
+class FakeObsidian:
+    def __init__(self, root):
+        self.root = root
+
+    async def get_note(self, path: str) -> str:
+        p = self.root / path.lstrip("/")
+        if not p.exists():
+            raise FileNotFoundError(path)
+        return p.read_text(encoding="utf-8")
+
+    async def create_or_overwrite_note(self, path: str, content: str) -> None:
+        p = self.root / path.lstrip("/")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    async def append_to_note(self, path: str, content: str) -> None:
+        p = self.root / path.lstrip("/")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        existing = p.read_text(encoding="utf-8") if p.exists() else ""
+        p.write_text(existing + content, encoding="utf-8")
+
+    async def delete_note(self, path: str) -> None:
+        p = self.root / path.lstrip("/")
+        if p.exists():
+            p.unlink()
+
+    async def execute_command(self, cmd: str) -> None:
+        pass
+
+
 @pytest.mark.anyio
 async def test_complete_and_update_task_and_reschedule_event(tmp_path) -> None:
     from src.tools.calendar import reschedule_vault_calendar_event
@@ -302,35 +332,6 @@ async def test_complete_and_update_task_and_reschedule_event(tmp_path) -> None:
         generate_daily_executive_briefing,
     )
     from src.tools.tasks import complete_vault_task, update_vault_task
-
-    class FakeObsidian:
-        def __init__(self, root):
-            self.root = root
-
-        async def get_note(self, path: str) -> str:
-            p = self.root / path.lstrip("/")
-            if not p.exists():
-                raise FileNotFoundError(path)
-            return p.read_text(encoding="utf-8")
-
-        async def create_or_overwrite_note(self, path: str, content: str) -> None:
-            p = self.root / path.lstrip("/")
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-
-        async def append_to_note(self, path: str, content: str) -> None:
-            p = self.root / path.lstrip("/")
-            p.parent.mkdir(parents=True, exist_ok=True)
-            existing = p.read_text(encoding="utf-8") if p.exists() else ""
-            p.write_text(existing + content, encoding="utf-8")
-
-        async def delete_note(self, path: str) -> None:
-            p = self.root / path.lstrip("/")
-            if p.exists():
-                p.unlink()
-
-        async def execute_command(self, cmd: str) -> None:
-            pass
 
     obs = FakeObsidian(tmp_path)
     await obs.create_or_overwrite_note(
@@ -429,3 +430,107 @@ async def test_complete_and_update_task_and_reschedule_event(tmp_path) -> None:
     assert cleared_inbox.startswith("# ISA Inbox")
     assert "Question 4?" not in cleared_inbox
     assert "@ISA" in cleared_inbox
+
+
+@pytest.mark.anyio
+async def test_meeting_action_items_extraction_and_sync(tmp_path) -> None:
+    from src.tools.documents import (
+        parse_action_items_from_markdown,
+        sync_meeting_action_items,
+    )
+
+    meetings_dir = tmp_path / "Meetings"
+    meetings_dir.mkdir(parents=True)
+    meeting_note = meetings_dir / "Q4 Product Sync.md"
+    meeting_note.write_text(
+        "# Q4 Product Sync\n\n"
+        "## Discussion\n"
+        "- ACTION: Send updated pricing sheet to Bob\n"
+        "- [ ] Schedule security review with Alice\n"
+        "- Follow-up: Finalize launch deck by Friday\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_action_items_from_markdown(meeting_note.read_text(encoding="utf-8"))
+    assert len(parsed) == 3
+    assert "Send updated pricing sheet to Bob" in parsed
+    assert "Schedule security review with Alice" in parsed
+    assert "Finalize launch deck by Friday" in parsed
+
+    obs = FakeObsidian(tmp_path)
+    await obs.create_or_overwrite_note("Tasks.md", "# Active Tasks\n")
+
+    rel_path, added_lines, skipped = await sync_meeting_action_items(
+        obsidian=obs,
+        vault_root=tmp_path,
+        note_query="Q4 Product Sync",
+        due_date="2026-10-30",
+        tasks_filename="Tasks.md",
+        notify=False,
+    )
+    assert rel_path == "Meetings/Q4 Product Sync.md"
+    assert len(added_lines) == 3
+    assert skipped == 0
+
+    tasks_md = await obs.get_note("Tasks.md")
+    assert "Send updated pricing sheet to Bob (from [[Q4 Product Sync]]) 📅 2026-10-30" in tasks_md
+    assert "Schedule security review with Alice (from [[Q4 Product Sync]]) 📅 2026-10-30" in tasks_md
+
+    # Verify the meeting note itself has no raw '- [ ]' checkboxes to prevent duplicate indexing
+    updated_meeting = await obs.get_note("Meetings/Q4 Product Sync.md")
+    assert "- [ ]" not in updated_meeting
+    assert "## ⚡ Action Items" in updated_meeting
+    assert "- • Send updated pricing sheet to Bob" in updated_meeting
+
+    # Re-running sync should deduplicate all 3 items
+    _, added_again, skipped_again = await sync_meeting_action_items(
+        obsidian=obs,
+        vault_root=tmp_path,
+        note_query="Q4 Product Sync",
+        due_date="2026-10-30",
+        tasks_filename="Tasks.md",
+        notify=False,
+    )
+    assert len(added_again) == 0
+    assert skipped_again == 3
+
+
+def test_inline_note_command_extraction_and_formatting() -> None:
+    from src.agent import format_inline_note_response
+    from src.monitor.observer import extract_inline_note_command
+
+    note_md = (
+        "# Project Roadmap\n\n"
+        "Some context about Q4 milestones.\n\n"
+        "@ISA Summarize the key risks for this milestone.\n\n"
+        "## Next Section\n"
+    )
+    extracted = extract_inline_note_command(note_md, manual_trigger_only=True)
+    assert extracted is not None
+    cmd, start, end = extracted
+    assert cmd == "Summarize the key risks for this milestone."
+
+    callout = format_inline_note_response(
+        command=cmd,
+        response_text="- [ ] Check vendor timeline\n- All systems nominal.",
+    )
+    # Raw checkboxes inside inline callout must be converted to '- •'
+    assert "- [ ]" not in callout
+    assert "> - • Check vendor timeline" in callout
+
+    replaced = note_md[:start] + callout + note_md[end:]
+    # Once replaced, extract_inline_note_command must not re-trigger
+    assert extract_inline_note_command(replaced, manual_trigger_only=True) is None
+
+
+def test_scheduled_morning_briefing_trigger(tmp_path) -> None:
+    monitor = ActiveReminderMonitor(vault_path=tmp_path)
+    early_dt = datetime(2026, 10, 24, 7, 30)
+    morning_dt = datetime(2026, 10, 24, 8, 5)
+
+    # Before 08:00 -> False
+    assert monitor.should_trigger_morning_briefing("08:00", now=early_dt) is False
+    # At 08:05 -> True once
+    assert monitor.should_trigger_morning_briefing("08:00", now=morning_dt) is True
+    # Subsequent check on the same day -> False
+    assert monitor.should_trigger_morning_briefing("08:00", now=morning_dt) is False

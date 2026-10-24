@@ -96,6 +96,55 @@ def extract_pending_command(
     return command
 
 
+EXCLUDED_INLINE_DIRS = {"archive", "briefings", "templates", "calendar"}
+EXCLUDED_INLINE_FILENAMES = {"tasks.md"}
+
+
+def extract_inline_note_command(
+    content: str,
+    trigger_prefix: str = "@ISA",
+    manual_trigger_only: bool = False,
+) -> tuple[str, int, int] | None:
+    """Find an unanswered inline `@ISA <command>` line inside any vault Markdown note.
+
+    Returns `(command_str, span_start, span_end)` so the caller can replace the inline
+    `@ISA` line in-place with an `> [!NOTE] 🤖 ISA` callout block.
+    """
+    if THINKING_START_MARKER in content:
+        return None
+    if trigger_prefix.lower() not in content.lower():
+        return None
+
+    pattern = re.compile(
+        r"^[ \t]*(?:[-*][ \t]*)?@ISA\b[: \t]*(?P<cmd>[^\r\n]+)",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    for match in pattern.finditer(content):
+        raw_cmd = match.group("cmd").replace(CURSOR_PLACEHOLDER, "").strip()
+        if not raw_cmd:
+            continue
+
+        after_line = content[match.end() :]
+        if not after_line.startswith(("\n", "\r\n")):
+            continue
+
+        blank_line_match = re.match(r"^\r?\n[ \t]*\r?\n", after_line)
+        has_blank_line = blank_line_match is not None
+        is_fast_command = raw_cmd.lower() in FAST_COMMANDS
+
+        if manual_trigger_only:
+            if not (has_blank_line or is_fast_command):
+                continue
+        else:
+            ends_with_punct = raw_cmd.endswith(COMPLETE_SENTENCE_ENDINGS)
+            if not (has_blank_line or ends_with_punct or is_fast_command):
+                continue
+
+        return (raw_cmd, match.start(), match.end())
+
+    return None
+
+
 class InboxEventHandler(FileSystemEventHandler):
     """Monitors the designated Obsidian inbox note and vault Markdown files."""
 
@@ -108,6 +157,7 @@ class InboxEventHandler(FileSystemEventHandler):
         require_newline: bool = True,
         manual_trigger_only: bool = False,
         on_vault_change: Callable[[Path], None] | None = None,
+        on_inline_command: Callable[[Path, str], None] | None = None,
     ) -> None:
         super().__init__()
         self.inbox_path = inbox_path.resolve()
@@ -118,9 +168,11 @@ class InboxEventHandler(FileSystemEventHandler):
         self.require_newline = require_newline
         self.manual_trigger_only = manual_trigger_only
         self.on_vault_change = on_vault_change
+        self.on_inline_command = on_inline_command
         self._last_hash: str | None = self._compute_hash()
         self._last_agent_write_time: float = 0.0
         self._last_command_hash: str | None = None
+        self._last_inline_command_hashes: dict[Path, str] = {}
         self.last_user_edit_time: float = 0.0
         self.last_vault_edit_time: float = 0.0
 
@@ -206,15 +258,57 @@ class InboxEventHandler(FileSystemEventHandler):
             return None
         return p
 
+    def _is_eligible_inline_note(self, md_path: Path) -> bool:
+        """Return True if md_path is a user content note eligible for inline @ISA commands."""
+        if md_path.name.lower() in EXCLUDED_INLINE_FILENAMES:
+            return False
+        try:
+            rel_parts = md_path.relative_to(self.vault_root).parts
+        except ValueError:
+            return False
+        if len(rel_parts) > 1 and rel_parts[0].lower() in EXCLUDED_INLINE_DIRS:
+            return False
+        return True
+
+    def record_inline_agent_write(self, note_path: Path, command: str) -> None:
+        """Record an inline agent write so it does not re-trigger."""
+        resolved = note_path.resolve()
+        self._last_inline_command_hashes[resolved] = hashlib.md5(
+            command.encode("utf-8")
+        ).hexdigest()
+        self._last_agent_write_time = time.monotonic()
+
+    def _check_inline_note(self, md_path: Path) -> None:
+        if self.on_inline_command is None or not self._is_eligible_inline_note(md_path):
+            return
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        extracted = extract_inline_note_command(
+            content,
+            trigger_prefix=self.trigger_prefix,
+            manual_trigger_only=self.manual_trigger_only,
+        )
+        if extracted is None:
+            return
+        cmd, _, _ = extracted
+        cmd_hash = hashlib.md5(cmd.encode("utf-8")).hexdigest()
+        if self._last_inline_command_hashes.get(md_path) == cmd_hash:
+            return
+        self._last_inline_command_hashes[md_path] = cmd_hash
+        self.on_inline_command(md_path, cmd)
+
     def _handle_fs_path(self, path_bytes_or_str: bytes | str) -> None:
         if self._matches_inbox(path_bytes_or_str):
             self._check_and_dispatch()
             return
-        if self.on_vault_change is not None:
-            md_path = self._is_vault_markdown_note(path_bytes_or_str)
-            if md_path is not None:
-                self.last_vault_edit_time = time.monotonic()
+        md_path = self._is_vault_markdown_note(path_bytes_or_str)
+        if md_path is not None:
+            self.last_vault_edit_time = time.monotonic()
+            if self.on_vault_change is not None:
                 self.on_vault_change(md_path)
+            self._check_inline_note(md_path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if not event.is_directory:
@@ -241,6 +335,7 @@ def create_inbox_observer(
     require_newline: bool = True,
     manual_trigger_only: bool = False,
     on_vault_change: Callable[[Path], None] | None = None,
+    on_inline_command: Callable[[Path, str], None] | None = None,
 ) -> tuple[Observer, InboxEventHandler]:
     """Instantiate a watchdog Observer watching the Obsidian vault directory recursively."""
     inbox_path = inbox_path.resolve()
@@ -255,6 +350,7 @@ def create_inbox_observer(
         require_newline=require_newline,
         manual_trigger_only=manual_trigger_only,
         on_vault_change=on_vault_change,
+        on_inline_command=on_inline_command,
     )
     observer = Observer()
     observer.schedule(handler, str(inbox_path.parent), recursive=True)

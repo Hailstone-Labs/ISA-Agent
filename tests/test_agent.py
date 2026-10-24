@@ -10,6 +10,7 @@ from src.memory.context_window import RollingContextWindow, parse_inbox_entries
 from src.memory.ingest import MarkdownHeaderTextSplitter
 from src.memory.vector_db import (
     LocalVectorStore,
+    extract_wikilinks,
     ingest_vault_to_lancedb,
     reciprocal_rank_fusion,
     sync_single_vault_file_to_lancedb,
@@ -242,3 +243,42 @@ def test_incremental_single_file_lancedb_sync(tmp_path) -> None:
         vector_store=store,
     )
     assert len(store.get_all_chunks()) == 1
+
+
+def test_wikilink_one_hop_graph_traversal_in_hybrid_search(tmp_path) -> None:
+    assert extract_wikilinks("See [[Architecture Spec#Overview|Spec]] and [[Budget 2026]].") == [
+        "Architecture Spec",
+        "Budget 2026",
+    ]
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    (vault_dir / "Project_Apollo.md").write_text(
+        "# Project Apollo\nUnique token ZETA-991-LAUNCH. Linked dependency: [[Vendor_Contract_Delta]].\n",
+        encoding="utf-8",
+    )
+    (vault_dir / "Vendor_Contract_Delta.md").write_text(
+        "# Vendor Contract Delta\nPenalty clause is $50,000 per week of delay.\n",
+        encoding="utf-8",
+    )
+
+    settings = ISASettings(
+        OBSIDIAN_VAULT_PATH=vault_dir,
+        LANCEDB_URI=tmp_path / "lancedb",
+    )
+    embedder = DummyEmbedder()
+    store = LocalVectorStore(settings)
+    ingest_vault_to_lancedb(settings=settings, embedder=embedder, vector_store=store)
+
+    hits = store.hybrid_search(
+        query="ZETA-991-LAUNCH",
+        embedder=embedder,
+        limit=1,
+        expand_wikilinks=True,
+    )
+    file_paths = [h["file_path"] for h in hits]
+    assert "Project_Apollo.md" in file_paths
+    assert "Vendor_Contract_Delta.md" in file_paths
+    graph_hits = [h for h in hits if h.get("matched_graph")]
+    assert len(graph_hits) == 1
+    assert graph_hits[0]["file_path"] == "Vendor_Contract_Delta.md"

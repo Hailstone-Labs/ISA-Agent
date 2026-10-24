@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+from pathlib import Path
 import re
 from typing import Literal
 from urllib.parse import urlparse
@@ -24,6 +25,7 @@ from src.monitor.observer import (
     InboxEventHandler,
     RESPONSE_END_MARKER,
     THINKING_START_MARKER,
+    extract_inline_note_command,
 )
 from src.tools.calendar import (
     CalendarEventSpec,
@@ -39,6 +41,7 @@ from src.tools.documents import (
     create_synthesized_document,
     generate_daily_executive_briefing,
     instantiate_template_note,
+    sync_meeting_action_items,
 )
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import LOOPBACK_HOSTS, ObsidianRestClient
@@ -70,6 +73,7 @@ class ISADependencies:
     context_window: RollingContextWindow | None = None
     handler: InboxEventHandler | None = None
     active_command: str = ""
+    active_inline_note: str | None = None
     inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turn_tool_context: list[str] = field(default_factory=list)
 
@@ -119,6 +123,8 @@ def format_thinking_block(
 
 async def _update_thinking_status(deps: ISADependencies, status_line: str) -> None:
     """Update the live thinking indicator inside ISA_Inbox.md with an async lock to prevent races."""
+    if deps.active_inline_note is not None:
+        return
     async with deps.inbox_lock:
         try:
             current = await deps.obsidian.get_note(deps.settings.inbox_filename)
@@ -165,14 +171,16 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             "8. When asked to change a task's due date, priority, or wording, call `update_task`.\n"
             "9. When asked to generate a daily executive briefing or morning summary, call `generate_daily_briefing`.\n"
             "10. When asked to archive or clean up older inbox messages, call `archive_inbox`.\n"
-            "11. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
+            "11. When asked to extract, pull, or sync action items from a meeting note into Tasks.md, "
+            "call `extract_meeting_action_items`.\n"
+            "12. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
             "'Meeting Minutes Template', 'Project Brief Template'), call `create_note_from_template`.\n"
-            "12. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
+            "13. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
             "call `create_document`.\n"
-            "13. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
-            "14. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
+            "14. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
+            "15. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
             "notes, files, projects, or past records in their vault.\n"
-            "15. Never call `search_vault` more than once or twice per request."
+            "16. Never call `search_vault` more than once or twice per request."
         ),
     )
 
@@ -189,9 +197,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
 
     @agent.tool
     async def search_vault(ctx: RunContext[ISADependencies], query: str) -> str:
-        """Execute Hybrid RAG search (LanceDB Dense Vectors + BM25 + RRF) across the Obsidian vault."""
+        """Execute Hybrid RAG search (LanceDB Dense Vectors + BM25 + RRF + 1-Hop WikiLink Graph) across the Obsidian vault."""
         await _update_thinking_status(
-            ctx.deps, f"🔍 Searching vault memory (Hybrid RRF) for `{query}`..."
+            ctx.deps, f"🔍 Searching vault memory (Hybrid RRF + Graph) for `{query}`..."
         )
         store = ctx.deps.vector_store or LocalVectorStore(ctx.deps.settings)
         embedder = ctx.deps.embedder or LocalEmbedder(ctx.deps.settings)
@@ -201,16 +209,18 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             embedder=embedder,
             limit=5,
             rrf_k=ctx.deps.settings.rrf_k,
+            expand_wikilinks=True,
         )
         if hybrid_hits:
             formatted_chunks: list[str] = []
             for hit in hybrid_hits:
+                graph_tag = " [1-Hop WikiLink Graph Neighbor]" if hit.get("matched_graph") else ""
                 formatted_chunks.append(
-                    f"### File: `{hit['file_path']}` (Section: `{hit['heading_hierarchy']}`, RRF: {hit['rrf_score']:.4f})\n"
+                    f"### File: `{hit['file_path']}` (Section: `{hit['heading_hierarchy']}`, RRF: {hit['rrf_score']:.4f}){graph_tag}\n"
                     f"{hit['text']}"
                 )
                 ctx.deps.turn_tool_context.append(
-                    f"Found `{hit['file_path']}` ({hit['heading_hierarchy']}): {hit['text'][:120]}"
+                    f"Found `{hit['file_path']}` ({hit['heading_hierarchy']}){graph_tag}: {hit['text'][:120]}"
                 )
             return "\n\n---\n\n".join(formatted_chunks)
 
@@ -689,6 +699,51 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         )
         return f"Archived {count} older exchange(s) to `{archive_path}`."
 
+    @agent.tool
+    async def extract_meeting_action_items(
+        ctx: RunContext[ISADependencies],
+        note_query: str,
+        explicit_action_items: list[str] | None = None,
+        due_date: str | None = None,
+    ) -> str:
+        """Extract action items from a meeting note, format its '## ⚡ Action Items' section, and sync tasks into Tasks.md.
+
+        Args:
+            note_query: Vault path or keyword of the meeting note (e.g. 'Meetings/Q4 Planning.md' or 'Q4 Planning').
+            explicit_action_items: Optional list of extracted action item strings synthesized from the meeting prose.
+            due_date: Optional default due date in YYYY-MM-DD format for extracted tasks.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"⚡ Extracting and syncing action items from `{note_query}`..."
+        )
+        try:
+            note_rel_path, added_lines, skipped_count = await sync_meeting_action_items(
+                obsidian=ctx.deps.obsidian,
+                vault_root=ctx.deps.settings.obsidian_vault_path,
+                note_query=note_query,
+                tasks_filename=ctx.deps.settings.active_tasks_filename,
+                explicit_items=explicit_action_items,
+                due_date=due_date,
+            )
+        except ValueError as exc:
+            return f"Could not extract meeting action items: {exc}"
+
+        _sync_vault_index_immediately(ctx.deps)
+        if not added_lines and skipped_count == 0:
+            return f"No action items were found in `{note_rel_path}`."
+
+        ctx.deps.turn_tool_context.append(
+            f"Synced {len(added_lines)} action item(s) from `{note_rel_path}` to `{ctx.deps.settings.active_tasks_filename}`"
+        )
+        summary_lines = [
+            f"Processed meeting note `{note_rel_path}`:",
+            f"- **New tasks added to `{ctx.deps.settings.active_tasks_filename}`:** {len(added_lines)}",
+            f"- **Already on task list (deduplicated):** {skipped_count}",
+        ]
+        for line in added_lines:
+            summary_lines.append(f"  - `{line}`")
+        return "\n".join(summary_lines)
+
     return agent
 
 
@@ -894,5 +949,145 @@ async def dispatch_inbox_command(
         "Appended ISA response (%d chars) to %s",
         len(reply_text),
         deps.settings.inbox_filename,
+    )
+    return reply_text
+
+
+def format_inline_note_response(
+    command: str,
+    response_text: str,
+    timestamp: datetime | None = None,
+) -> str:
+    """Format an inline ISA callout block that replaces an `@ISA <command>` line inside any vault note.
+
+    Replaces the raw `@ISA` trigger prefix with a `> [!NOTE] 🤖 ISA` callout header so the
+    note never re-triggers, and converts any `- [ ]` checkboxes inside the callout to `- •`
+    so Obsidian Tasks does not double-index tasks alongside Tasks.md.
+    """
+    ts = (timestamp or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    sanitized_body = re.sub(
+        r"^(\s*-\s*)\[[ xX]\]\s+",
+        r"\1• ",
+        response_text.strip(),
+        flags=re.MULTILINE,
+    )
+    blockquote_lines = "\n".join(
+        f"> {line}" if line else ">" for line in sanitized_body.splitlines()
+    )
+    preview_cmd = command.replace("\n", " ").strip()
+    return (
+        f"> [!NOTE] 🤖 ISA (`{preview_cmd}`) — {ts}\n"
+        f"{blockquote_lines}\n"
+    )
+
+
+async def dispatch_inline_note_command(
+    note_path: Path,
+    command: str,
+    deps: ISADependencies,
+    handler: InboxEventHandler | None = None,
+    agent: Agent[ISADependencies, str] | None = None,
+) -> str:
+    """Execute an inline `@ISA <command>` found inside any vault Markdown note and write the reply in-place."""
+    resolved_path = note_path.resolve()
+    vault_root = deps.settings.obsidian_vault_path.resolve()
+    try:
+        rel_path = resolved_path.relative_to(vault_root).as_posix()
+    except ValueError:
+        rel_path = resolved_path.name
+
+    deps.handler = handler
+    deps.active_command = command
+    deps.active_inline_note = rel_path
+    deps.turn_tool_context.clear()
+
+    try:
+        note_content = resolved_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        deps.active_inline_note = None
+        return f"Error reading inline note `{rel_path}`: {exc}"
+
+    extracted = extract_inline_note_command(
+        note_content,
+        manual_trigger_only=deps.settings.manual_trigger_only,
+    )
+    if extracted is None:
+        # Fallback if called directly without trailing blank line in tests
+        pattern = re.compile(
+            r"^[ \t]*(?:[-*][ \t]*)?@ISA\b[: \t]*(?P<cmd>[^\r\n]+)",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        m = pattern.search(note_content)
+        if m is None:
+            deps.active_inline_note = None
+            return ""
+        span_start, span_end = m.start(), m.end()
+    else:
+        _, span_start, span_end = extracted
+
+    active_agent = agent or build_isa_agent(deps.settings)
+    context_excerpt = (note_content[:span_start] + note_content[span_end:]).strip()
+    contextual_prompt = (
+        f"[Inline request inside vault note `{rel_path}`]\n"
+        f"Current Note Content:\n```markdown\n{context_excerpt[:4000]}\n```\n\n"
+        f"User Instruction: {command}"
+    )
+
+    logger.info(
+        "Dispatching inline @ISA command in '%s': %r",
+        rel_path,
+        command,
+    )
+
+    try:
+        result = await active_agent.run(contextual_prompt, deps=deps)
+        reply_text = result.output
+    except Exception as exc:
+        logger.exception("Error during inline LLM execution in %s: %s", rel_path, exc)
+        reply_text = f"Error processing inline request: `{exc}`"
+    finally:
+        deps.active_inline_note = None
+
+    callout_block = format_inline_note_response(command, reply_text)
+
+    # Re-read the note in case an agent tool (e.g. extract_meeting_action_items) updated it during the run
+    try:
+        latest_note_content = resolved_path.read_text(encoding="utf-8")
+    except OSError:
+        latest_note_content = note_content
+
+    latest_extracted = extract_inline_note_command(
+        latest_note_content,
+        manual_trigger_only=deps.settings.manual_trigger_only,
+    )
+    if latest_extracted is not None:
+        _, latest_start, latest_end = latest_extracted
+    else:
+        pattern = re.compile(
+            r"^[ \t]*(?:[-*][ \t]*)?@ISA\b[: \t]*(?P<cmd>[^\r\n]+)",
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        m = pattern.search(latest_note_content)
+        if m is not None:
+            latest_start, latest_end = m.start(), m.end()
+        else:
+            latest_start, latest_end = span_start, span_end
+
+    updated_content = (
+        latest_note_content[:latest_start]
+        + callout_block
+        + latest_note_content[latest_end:]
+    )
+
+    async with deps.inbox_lock:
+        if handler is not None:
+            handler.record_inline_agent_write(resolved_path, command)
+        await deps.obsidian.create_or_overwrite_note(rel_path, updated_content)
+
+    _sync_vault_index_immediately(deps)
+    send_macos_notification(
+        title="ISA Inline Response Ready",
+        subtitle=rel_path,
+        message=command[:80],
     )
     return reply_text

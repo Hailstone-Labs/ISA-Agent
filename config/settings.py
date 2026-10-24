@@ -71,6 +71,11 @@ class ISASettings(BaseSettings):
         alias="ISA_MANUAL_TRIGGER_ONLY",
         description="If True, triggers when pressing Enter after the prompt, ignoring mid-sentence or terminal punctuation.",
     )
+    morning_briefing_time: str = Field(
+        default="08:00",
+        alias="ISA_MORNING_BRIEFING_TIME",
+        description="24-hour HH:MM time when ISA automatically generates the daily morning briefing (empty string to disable).",
+    )
 
     # Semantic Memory (LanceDB & Rolling Context) settings
     lancedb_uri: Path = Field(default=Path("./data/lancedb"), alias="LANCEDB_URI")

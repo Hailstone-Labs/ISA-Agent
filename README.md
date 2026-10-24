@@ -160,6 +160,7 @@ cp .env.example .env
 | `ISA_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local FastEmbed ONNX model cached in `./data/models` |
 | `ISA_RRF_K` | `60` | Smoothing constant $k$ for Reciprocal Rank Fusion |
 | `ISA_CONTEXT_WINDOW_SIZE` | `10` | Number of recent conversation entries retained in `data/rolling_context.json` |
+| `ISA_MORNING_BRIEFING_TIME` | `08:00` | 24-hour `HH:MM` time when ISA auto-generates the morning briefing (`""` to disable) |
 
 ---
 
@@ -210,6 +211,19 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 @ISA /clear      # Wipes ISA_Inbox.md back to a completely clean slate with a fresh @ISA prompt line
 @ISA /rescan     # Forces a full vault LanceDB re-index with macOS desktop notification
 ```
+
+#### H. Meeting Action-Item Extraction & Inline `@ISA` Anywhere in the Vault
+- **Meeting Action-Item Extraction (`extract_meeting_action_items`)**:
+  ```markdown
+  @ISA Extract the action items from Meetings/Q4 Product Sync.md and add them to my task list.
+  ```
+  *Parses `ACTION:`, `TODO:`, `Follow-up:`, and action-verb bullets, formats the meeting note's `## ⚡ Action Items` section cleanly with read-only `- •` bullets (preventing duplicate Obsidian Tasks indexing), and syncs deduplicated `- [ ] ... (from [[Meeting]])` tasks into `Tasks.md`.*
+- **Inline `@ISA` Anywhere in the Vault**:
+  - Type `@ISA <instruction>` directly inside any regular vault note (e.g., inside `Meetings/*.md` or `Projects/*.md`) and press `Enter` twice. ISA responds in-place inside that note with a rendered `> [!NOTE] 🤖 ISA` callout block without needing to switch to `ISA_Inbox.md`.
+- **1-Hop `[[WikiLink]]` Graph Traversal**:
+  - `search_vault` automatically follows outgoing `[[WikiLinks]]` and incoming backlinks 1 hop across the vault so linked notes are included alongside top Hybrid RRF hits.
+- **Scheduled Morning Briefing Auto-Generation**:
+  - Every morning at `ISA_MORNING_BRIEFING_TIME` (default `08:00`), the background daemon automatically generates `Briefings/YYYY-MM-DD - Executive Briefing.md` and fires a macOS desktop notification.
 
 ---
 
