@@ -155,6 +155,16 @@ def _parse_calendar_frontmatter(md_text: str) -> dict:
         return {}
 
 
+def _extract_calendar_body(md_text: str) -> str:
+    """Extract the Markdown body below YAML frontmatter from a Calendar/*.md file."""
+    if not md_text.startswith("---"):
+        return md_text.strip()
+    parts = md_text.split("---", 2)
+    if len(parts) < 3:
+        return ""
+    return parts[2].strip()
+
+
 def list_vault_calendar_events(
     vault_path: Path,
     folder: str = "Calendar",
@@ -244,3 +254,95 @@ async def cancel_vault_calendar_event(
                 message=", ".join(Path(p).stem for p in deleted_paths),
             )
     return deleted_paths
+
+
+async def reschedule_vault_calendar_event(
+    obsidian: ObsidianRestClient,
+    vault_path: Path,
+    title_query: str,
+    new_date: str | None = None,
+    new_start_time: str | None = None,
+    new_end_time: str | None = None,
+    new_title: str | None = None,
+    date_filter: str | None = None,
+    folder: str = "Calendar",
+    notify: bool = True,
+) -> tuple[str, CalendarEventSpec] | None:
+    """Reschedule or update an existing calendar event note, moving the file if date/title changed."""
+    all_events = list_vault_calendar_events(
+        vault_path=vault_path,
+        folder=folder,
+        date_filter=date_filter,
+    )
+    query_low = title_query.strip().lower()
+    query_tokens = [tok for tok in re.findall(r"\w+", query_low) if len(tok) > 2]
+
+    target_ev: dict | None = None
+    for ev in all_events:
+        title_low = ev["title"].lower()
+        file_low = ev["file_path"].lower()
+        if (
+            query_low in title_low
+            or title_low in query_low
+            or query_low in file_low
+            or (query_tokens and all(tok in title_low for tok in query_tokens))
+        ):
+            target_ev = ev
+            break
+
+    if target_ev is None:
+        return None
+
+    old_rel_path = target_ev["file_path"]
+    old_file = vault_path / old_rel_path
+    existing_body = ""
+    if old_file.exists():
+        try:
+            existing_body = _extract_calendar_body(old_file.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+
+    updated_date = validate_iso_date(new_date) if new_date else target_ev["date"]
+    updated_title = new_title.strip() if new_title else target_ev["title"]
+    updated_start = (
+        new_start_time.strip() if new_start_time else target_ev["start_time"]
+    )
+    updated_end = new_end_time.strip() if new_end_time else target_ev["end_time"]
+    all_day = bool(target_ev["all_day"]) and not (new_start_time or new_end_time)
+
+    spec = CalendarEventSpec(
+        title=updated_title,
+        date=updated_date,
+        end_date=updated_date,
+        all_day=all_day,
+        start_time=updated_start,
+        end_time=updated_end,
+        agenda_or_notes=existing_body,
+    )
+    new_rel_path = await create_vault_calendar_event(
+        obsidian=obsidian,
+        event=spec,
+        folder=folder,
+        notify=False,
+    )
+    if old_rel_path != new_rel_path:
+        try:
+            await obsidian.delete_note(old_rel_path)
+        except Exception:
+            if old_file.exists():
+                old_file.unlink()
+        try:
+            await obsidian.execute_command("obsidian-full-calendar:full-calendar-reset")
+        except Exception:
+            pass
+
+    if notify:
+        time_label = (
+            "All Day" if spec.all_day else f"{spec.start_time}–{spec.end_time}"
+        )
+        send_macos_notification(
+            title="ISA Rescheduled Event",
+            subtitle=f"{spec.date} ({time_label})",
+            message=spec.title,
+        )
+    return new_rel_path, spec

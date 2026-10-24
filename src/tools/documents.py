@@ -7,8 +7,11 @@ from pathlib import Path, PurePosixPath
 import re
 from pydantic import BaseModel, Field, field_validator
 import yaml
+from src.monitor.observer import CURSOR_PLACEHOLDER, RESPONSE_END_MARKER
+from src.tools.calendar import list_vault_calendar_events
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import ObsidianRestClient
+from src.tools.tasks import list_vault_tasks
 
 OUTER_MARKDOWN_FENCE_RE = re.compile(
     r"^\s*```(?:markdown|md|yaml)?\s*\n(.*?)\n```\s*$",
@@ -188,3 +191,193 @@ async def instantiate_template_note(
             message=f"Created {safe_target}",
         )
     return safe_target
+
+
+async def generate_daily_executive_briefing(
+    obsidian: ObsidianRestClient,
+    vault_root: Path,
+    target_date: str | None = None,
+    calendar_folder: str = "Calendar",
+    tasks_filename: str = "Tasks.md",
+    briefings_folder: str = "Briefings",
+    notify: bool = True,
+) -> tuple[str, str]:
+    """Generate a Daily Executive Briefing note combining today's events, open tasks, and recent notes."""
+    date_str = target_date or datetime.now().strftime("%Y-%m-%d")
+    all_events = list_vault_calendar_events(vault_path=vault_root, folder=calendar_folder)
+    today_events = [ev for ev in all_events if ev["date"] == date_str]
+    upcoming_events = [ev for ev in all_events if ev["date"] > date_str][:5]
+
+    open_tasks = await list_vault_tasks(
+        obsidian=obsidian,
+        tasks_filename=tasks_filename,
+        include_completed=False,
+    )
+    due_today_or_overdue: list[str] = []
+    other_open_tasks: list[str] = []
+    for t in open_tasks:
+        due_m = re.search(r"📅\s*(\d{4}-\d{2}-\d{2})", t)
+        if due_m and due_m.group(1) <= date_str:
+            due_today_or_overdue.append(t)
+        else:
+            other_open_tasks.append(t)
+
+    # Discover recent meeting notes
+    meetings_dir = vault_root / "Meetings"
+    recent_meetings: list[str] = []
+    if meetings_dir.exists():
+        md_files = sorted(
+            meetings_dir.glob("*.md"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for mf in md_files[:3]:
+            recent_meetings.append(f"- [[{mf.stem}]]")
+
+    lines = [
+        "---",
+        f'title: "Daily Executive Briefing - {date_str}"',
+        f"date: {date_str}",
+        "type: executive-briefing",
+        "tags:",
+        "  - briefing",
+        "  - executive",
+        "---",
+        f"# ☀️ Daily Executive Briefing — {date_str}",
+        "",
+        "## 📅 Today's Schedule",
+    ]
+    if today_events:
+        for ev in today_events:
+            time_lbl = "All Day" if ev["all_day"] else f"{ev['start_time']}–{ev['end_time']}"
+            lines.append(f"- **{time_lbl}** — {ev['title']} (`{ev['file_path']}`)")
+    else:
+        lines.append("- *No meetings scheduled for today.*")
+
+    lines.extend(["", "## 🔥 Priority & Due Tasks (Today / Overdue)"])
+    if due_today_or_overdue:
+        for t in due_today_or_overdue:
+            bullet = re.sub(r"^-\s*\[[ xX]\]\s*", "- • ", t.strip())
+            lines.append(bullet)
+    else:
+        lines.append("- *No overdue or due-today tasks.*")
+
+    lines.extend(["", "## 📋 Other Open Tasks"])
+    if other_open_tasks:
+        for t in other_open_tasks:
+            bullet = re.sub(r"^-\s*\[[ xX]\]\s*", "- • ", t.strip())
+            lines.append(bullet)
+    else:
+        lines.append("- *No additional open tasks.*")
+
+    lines.extend(["", "## 🗓️ Upcoming Calendar Horizon"])
+    if upcoming_events:
+        for ev in upcoming_events:
+            time_lbl = "All Day" if ev["all_day"] else f"{ev['start_time']}–{ev['end_time']}"
+            lines.append(f"- **{ev['date']} ({time_lbl})** — {ev['title']}")
+    else:
+        lines.append("- *No upcoming events on the horizon.*")
+
+    if recent_meetings:
+        lines.extend(["", "## 🤝 Recent Meeting Notes", *recent_meetings])
+
+    briefing_md = "\n".join(lines) + "\n"
+    target_path = f"{briefings_folder.strip('/')}/{date_str} - Executive Briefing.md"
+    await obsidian.create_or_overwrite_note(target_path, briefing_md)
+
+    if notify:
+        send_macos_notification(
+            title="ISA Executive Briefing Ready",
+            subtitle=date_str,
+            message=f"{len(today_events)} event(s) today, {len(open_tasks)} open task(s).",
+        )
+    return target_path, briefing_md
+
+
+async def archive_inbox_transcript(
+    obsidian: ObsidianRestClient,
+    inbox_filename: str = "ISA_Inbox.md",
+    archive_folder: str = "Archive",
+    keep_recent_exchanges: int = 2,
+    notify: bool = True,
+) -> tuple[str | None, int]:
+    """Archive older completed exchanges from ISA_Inbox.md into Archive/ISA_Transcript_YYYY-MM.md.
+
+    Keeps the most recent `keep_recent_exchanges` exchanges in ISA_Inbox.md so active visual
+    context remains smoothly visible while preventing inbox bloat.
+    """
+    try:
+        content = await obsidian.get_note(inbox_filename)
+    except Exception:
+        return None, 0
+
+    if RESPONSE_END_MARKER not in content:
+        return None, 0
+
+    parts = content.split(RESPONSE_END_MARKER)
+    completed_blocks = parts[:-1]
+    if len(completed_blocks) <= keep_recent_exchanges:
+        return None, 0
+
+    num_to_archive = len(completed_blocks) - keep_recent_exchanges
+    blocks_to_archive = completed_blocks[:num_to_archive]
+    blocks_to_keep = completed_blocks[num_to_archive:]
+
+    month_tag = datetime.now().strftime("%Y-%m")
+    archive_path = f"{archive_folder.strip('/')}/ISA_Transcript_{month_tag}.md"
+    archive_chunk = (
+        f"\n\n<!-- Archived on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} -->\n"
+        + f"{RESPONSE_END_MARKER}".join(blocks_to_archive)
+        + f"{RESPONSE_END_MARKER}\n"
+    )
+
+    try:
+        existing_archive = await obsidian.get_note(archive_path)
+        await obsidian.append_to_note(archive_path, archive_chunk)
+    except Exception:
+        header = (
+            "---\n"
+            f'title: "ISA Conversation Archive ({month_tag})"\n'
+            "type: isa-archive\n"
+            "---\n"
+            f"# 🗄️ ISA Conversation Transcript Archive ({month_tag})\n"
+        )
+        await obsidian.create_or_overwrite_note(archive_path, header + archive_chunk)
+
+    kept_body = f"{RESPONSE_END_MARKER}".join(blocks_to_keep) + f"{RESPONSE_END_MARKER}"
+    new_inbox = (
+        "# ISA Inbox\n\n"
+        f"> *Archived {num_to_archive} older exchange(s) to [[{archive_path[:-3]}]].*\n\n"
+        + kept_body.lstrip()
+        + f"\n\n---\n\n@ISA {CURSOR_PLACEHOLDER}\n"
+    )
+    await obsidian.create_or_overwrite_note(inbox_filename, new_inbox)
+
+    if notify:
+        send_macos_notification(
+            title="ISA Inbox Archived",
+            subtitle=f"Moved {num_to_archive} exchange(s)",
+            message=f"Saved to {archive_path}",
+        )
+    return archive_path, num_to_archive
+
+
+async def clear_inbox_page(
+    obsidian: ObsidianRestClient,
+    inbox_filename: str = "ISA_Inbox.md",
+    notify: bool = True,
+) -> str:
+    """Wipe ISA_Inbox.md back to a clean slate with a fresh @ISA prompt line."""
+    clean_slate = (
+        "# ISA Inbox\n\n"
+        "Type commands below using `@ISA`.\n\n"
+        f"@ISA {CURSOR_PLACEHOLDER}\n"
+    )
+    await obsidian.create_or_overwrite_note(inbox_filename, clean_slate)
+    if notify:
+        send_macos_notification(
+            title="ISA Inbox Cleared",
+            subtitle=inbox_filename,
+            message="Inbox page reset to a clean slate.",
+        )
+    return clean_slate

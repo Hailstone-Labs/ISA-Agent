@@ -75,6 +75,30 @@ class LocalVectorStore:
         self.db.create_table(self.TABLE_NAME, data=payload, mode="overwrite")
         return len(payload)
 
+    def delete_file_chunks(self, rel_file_path: str) -> None:
+        """Delete all stored chunks belonging to a specific vault-relative file path."""
+        if self.TABLE_NAME not in self.list_tables():
+            return
+        safe_path = rel_file_path.replace("'", "''")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.delete(f"file_path = '{safe_path}'")
+
+    def upsert_file_chunks(
+        self,
+        rel_file_path: str,
+        records: list[VaultChunkRecord],
+    ) -> int:
+        """Replace only the chunks for a single vault file without re-embedding the entire vault."""
+        if self.TABLE_NAME not in self.list_tables():
+            return self.upsert_chunks(records)
+        self.delete_file_chunks(rel_file_path)
+        if not records:
+            return 0
+        table = self.db.open_table(self.TABLE_NAME)
+        payload = [rec.model_dump() for rec in records]
+        table.add(payload)
+        return len(payload)
+
     def get_all_chunks(self) -> list[dict]:
         """Return all stored chunk records from LanceDB."""
         if self.TABLE_NAME not in self.list_tables():
@@ -224,3 +248,65 @@ def ingest_vault_to_lancedb(
         store.uri,
     )
     return count
+
+
+def sync_single_vault_file_to_lancedb(
+    file_path: Path,
+    settings: ISASettings | None = None,
+    embedder: EmbedderProtocol | None = None,
+    vector_store: LocalVectorStore | None = None,
+) -> int:
+    """Incrementally update or remove a single vault Markdown file in LanceDB."""
+    cfg = settings or get_settings()
+    store = vector_store or LocalVectorStore(cfg)
+    vault_root = cfg.obsidian_vault_path.resolve()
+    resolved = file_path.resolve()
+    try:
+        rel_path = str(resolved.relative_to(vault_root))
+    except ValueError:
+        return 0
+
+    if resolved.name == cfg.inbox_filename or any(
+        p.startswith(".") for p in Path(rel_path).parts
+    ):
+        return 0
+
+    if not resolved.exists():
+        store.delete_file_chunks(rel_path)
+        logger.info("Removed deleted file '%s' from LanceDB.", rel_path)
+        return 0
+
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+
+    splitter = MarkdownHeaderTextSplitter()
+    chunks = splitter.split_text(text, file_path=rel_path)
+    if not chunks:
+        store.delete_file_chunks(rel_path)
+        return 0
+
+    emb = embedder or LocalEmbedder(cfg)
+    texts_to_embed = [
+        f"File: {c.file_path}\nSection: {c.heading_hierarchy}\n\n{c.text}"
+        for c in chunks
+    ]
+    vectors = emb.embed_documents(texts_to_embed)
+    records = [
+        VaultChunkRecord(
+            chunk_id=chunk.chunk_id,
+            file_path=chunk.file_path,
+            heading_hierarchy=chunk.heading_hierarchy,
+            text=chunk.text,
+            vector=vec,
+        )
+        for chunk, vec in zip(chunks, vectors, strict=True)
+    ]
+    upserted = store.upsert_file_chunks(rel_path, records)
+    logger.info(
+        "Incrementally synced %d chunk(s) for '%s' in LanceDB.",
+        upserted,
+        rel_path,
+    )
+    return upserted

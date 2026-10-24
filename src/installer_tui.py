@@ -252,11 +252,15 @@ def scaffold_vault_files(vault_path: Path) -> None:
             "```tasks\n"
             "not done\n"
             "path does not include ISA_Inbox\n"
+            "path does not include Archive\n"
+            "path does not include Briefings\n"
+            "path does not include Reports\n"
             "path does not include Templates\n"
             "description regex does not match /^$/\n"
             "sort by priority\n"
             "sort by due\n"
-            "```\n",
+            "```\n\n"
+            "## Task List\n\n",
             encoding="utf-8",
         )
 

@@ -30,15 +30,25 @@ from src.tools.calendar import (
     cancel_vault_calendar_event,
     create_vault_calendar_event,
     list_vault_calendar_events,
+    reschedule_vault_calendar_event,
 )
 from src.tools.documents import (
     SynthesizedDocumentSpec,
+    archive_inbox_transcript,
+    clear_inbox_page,
     create_synthesized_document,
+    generate_daily_executive_briefing,
     instantiate_template_note,
 )
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import LOOPBACK_HOSTS, ObsidianRestClient
-from src.tools.tasks import TaskSpec, append_vault_task, list_vault_tasks
+from src.tools.tasks import (
+    TaskSpec,
+    append_vault_task,
+    complete_vault_task,
+    list_vault_tasks,
+    update_vault_task,
+)
 
 logger = logging.getLogger("isa.agent")
 
@@ -146,18 +156,23 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             "resolved YYYY-MM-DD dates computed from the Current System Time.\n"
             "2. When asked what is on the schedule or calendar, call `list_calendar_events`.\n"
             "3. When asked to cancel, remove, or delete a calendar meeting or appointment, call `cancel_calendar_event`.\n"
-            "4. When asked what tasks, to-dos, or items exist, call `list_tasks`.\n"
-            "5. When asked to add or create a task, reminder, or to-do item, call `create_task` "
+            "4. When asked to reschedule, move, or change the time/date of an existing calendar event, call `reschedule_calendar_event`.\n"
+            "5. When asked what tasks, to-dos, or items exist, call `list_tasks`.\n"
+            "6. When asked to add or create a task, reminder, or to-do item, call `create_task` "
             "with resolved YYYY-MM-DD dates and valid Obsidian Tasks recurrence rules starting "
             "with 'every ' (e.g. 'every week on Friday', 'every weekday').\n"
-            "6. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
+            "7. When asked to mark a task as done, finished, or completed, call `complete_task`.\n"
+            "8. When asked to change a task's due date, priority, or wording, call `update_task`.\n"
+            "9. When asked to generate a daily executive briefing or morning summary, call `generate_daily_briefing`.\n"
+            "10. When asked to archive or clean up older inbox messages, call `archive_inbox`.\n"
+            "11. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
             "'Meeting Minutes Template', 'Project Brief Template'), call `create_note_from_template`.\n"
-            "7. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
+            "12. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
             "call `create_document`.\n"
-            "8. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
-            "9. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
+            "13. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
+            "14. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
             "notes, files, projects, or past records in their vault.\n"
-            "10. Never call `search_vault` more than once or twice per request."
+            "15. Never call `search_vault` more than once or twice per request."
         ),
     )
 
@@ -511,7 +526,168 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             f"Successfully instantiated `{saved_path}` from template `{template_name}`."
         )
 
-    return agent
+    @agent.tool
+    async def complete_task(
+        ctx: RunContext[ISADependencies],
+        description_query: str,
+    ) -> str:
+        """Mark an existing open task in Tasks.md as completed (- [x] ... ✅ YYYY-MM-DD).
+
+        Args:
+            description_query: Keyword or phrase identifying the task to mark completed.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"☑️ Completing task matching `{description_query}`..."
+        )
+        completed = await complete_vault_task(
+            obsidian=ctx.deps.obsidian,
+            description_query=description_query,
+            tasks_filename=ctx.deps.settings.active_tasks_filename,
+        )
+        if not completed:
+            return f"No open task matched '{description_query}' in `{ctx.deps.settings.active_tasks_filename}`."
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Completed task(s): {'; '.join(completed)}")
+        return (
+            f"Marked {len(completed)} task(s) as completed in `{ctx.deps.settings.active_tasks_filename}`:\n"
+            + "\n".join(f"`{c}`" for c in completed)
+        )
+
+    @agent.tool
+    async def update_task(
+        ctx: RunContext[ISADependencies],
+        description_query: str,
+        new_description: str | None = None,
+        new_due_date: str | None = None,
+        new_scheduled_date: str | None = None,
+        new_priority: Literal["high", "medium", "low", "normal"] | None = None,
+    ) -> str:
+        """Update an existing open task's due date, scheduled date, priority, or description in Tasks.md.
+
+        Args:
+            description_query: Keyword or phrase identifying the existing open task.
+            new_description: Optional updated description text.
+            new_due_date: Optional updated due date in YYYY-MM-DD format (📅).
+            new_scheduled_date: Optional updated scheduled date in YYYY-MM-DD format (⏳).
+            new_priority: Optional updated priority ('high', 'medium', 'low', 'normal').
+        """
+        await _update_thinking_status(
+            ctx.deps, f"✏️ Updating task matching `{description_query}`..."
+        )
+        try:
+            updated_line = await update_vault_task(
+                obsidian=ctx.deps.obsidian,
+                description_query=description_query,
+                new_description=new_description,
+                new_due_date=new_due_date,
+                new_scheduled_date=new_scheduled_date,
+                new_priority=new_priority,
+                tasks_filename=ctx.deps.settings.active_tasks_filename,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise ModelRetry(f"Task update validation failed: {exc}") from exc
+
+        if updated_line is None:
+            return f"No open task matched '{description_query}' in `{ctx.deps.settings.active_tasks_filename}`."
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Updated task: {updated_line}")
+        return f"Updated task in `{ctx.deps.settings.active_tasks_filename}`:\n`{updated_line}`"
+
+    @agent.tool
+    async def reschedule_calendar_event(
+        ctx: RunContext[ISADependencies],
+        title_query: str,
+        new_date: str | None = None,
+        new_start_time: str | None = None,
+        new_end_time: str | None = None,
+        new_title: str | None = None,
+        date_filter: str | None = None,
+    ) -> str:
+        """Reschedule or move an existing calendar event to a new date or 24-hour time.
+
+        Args:
+            title_query: Title or keyword of the existing event to reschedule.
+            new_date: Optional new date in YYYY-MM-DD format.
+            new_start_time: Optional new start time in 24-hour HH:MM format (e.g. '15:00').
+            new_end_time: Optional new end time in 24-hour HH:MM format (e.g. '16:00').
+            new_title: Optional updated title for the event.
+            date_filter: Optional current date filter (YYYY-MM-DD) if multiple events share a title.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"📅 Rescheduling calendar event matching `{title_query}`..."
+        )
+        try:
+            res = await reschedule_vault_calendar_event(
+                obsidian=ctx.deps.obsidian,
+                vault_path=ctx.deps.settings.obsidian_vault_path,
+                title_query=title_query,
+                new_date=new_date,
+                new_start_time=new_start_time,
+                new_end_time=new_end_time,
+                new_title=new_title,
+                date_filter=date_filter,
+                folder=ctx.deps.settings.calendar_folder,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise ModelRetry(f"Event reschedule validation failed: {exc}") from exc
+
+        if res is None:
+            return f"No scheduled calendar event matched '{title_query}'."
+        new_path, spec = res
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(
+            f"Rescheduled `{spec.title}` to {spec.date} ({spec.start_time}-{spec.end_time}) at `{new_path}`"
+        )
+        return (
+            f"Rescheduled calendar event to `{new_path}`:\n"
+            f"```yaml\n{spec.to_markdown().strip()}\n```"
+        )
+
+    @agent.tool
+    async def generate_daily_briefing(
+        ctx: RunContext[ISADependencies],
+        target_date: str | None = None,
+    ) -> str:
+        """Generate a comprehensive Daily Executive Briefing note in Briefings/ combining today's schedule, tasks, and recent meetings.
+
+        Args:
+            target_date: Optional date in YYYY-MM-DD format (defaults to today).
+        """
+        await _update_thinking_status(
+            ctx.deps, "☀️ Generating Daily Executive Briefing..."
+        )
+        saved_path, briefing_md = await generate_daily_executive_briefing(
+            obsidian=ctx.deps.obsidian,
+            vault_root=ctx.deps.settings.obsidian_vault_path,
+            target_date=target_date,
+            calendar_folder=ctx.deps.settings.calendar_folder,
+            tasks_filename=ctx.deps.settings.active_tasks_filename,
+        )
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(f"Generated briefing at `{saved_path}`")
+        return f"Created Daily Executive Briefing at `{saved_path}`:\n\n{briefing_md}"
+
+    @agent.tool
+    async def archive_inbox(
+        ctx: RunContext[ISADependencies],
+        keep_recent_exchanges: int = 2,
+    ) -> str:
+        """Archive older completed conversation exchanges from ISA_Inbox.md into Archive/ISA_Transcript_YYYY-MM.md."""
+        await _update_thinking_status(
+            ctx.deps, "🗄️ Archiving older ISA_Inbox.md conversation exchanges..."
+        )
+        archive_path, count = await archive_inbox_transcript(
+            obsidian=ctx.deps.obsidian,
+            inbox_filename=ctx.deps.settings.inbox_filename,
+            keep_recent_exchanges=keep_recent_exchanges,
+        )
+        if not archive_path or count == 0:
+            return "Inbox is already compact; no older exchanges needed archiving."
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(
+            f"Archived {count} exchange(s) to `{archive_path}`"
+        )
+        return f"Archived {count} older exchange(s) to `{archive_path}`."
 
     return agent
 
@@ -560,27 +736,76 @@ async def dispatch_inbox_command(
             persist_path=deps.settings.context_window_path,
         )
 
-    # Fast-path for deterministic commands like /rescan
+    # Fast-path for deterministic commands like /rescan, /briefing, and /archive
     clean_cmd = command.strip().lower()
     if clean_cmd in FAST_COMMANDS:
         logger.info("Executing fast-path command: %s", clean_cmd)
-        count = _sync_vault_index_immediately(deps)
-        reply_text = (
-            f"🔄 **Vault Database Rescanned Successfully**\n\n"
-            f"- **Chunks Indexed:** {count}\n"
-            f"- **Store:** LanceDB (`{deps.settings.lancedb_uri}`)\n"
-            f"- **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        send_macos_notification(
-            title="ISA Database Rescanned",
-            subtitle=f"{count} chunks indexed",
-            message="LanceDB Hybrid memory updated successfully.",
-        )
+        if clean_cmd in {"/briefing", "briefing"}:
+            saved_path, briefing_md = await generate_daily_executive_briefing(
+                obsidian=deps.obsidian,
+                vault_root=deps.settings.obsidian_vault_path,
+                calendar_folder=deps.settings.calendar_folder,
+                tasks_filename=deps.settings.active_tasks_filename,
+            )
+            _sync_vault_index_immediately(deps)
+            reply_text = (
+                f"☀️ **Daily Executive Briefing Generated** (`{saved_path}`)\n\n"
+                f"{briefing_md.split('---', 2)[-1].strip()}"
+            )
+            tool_note = f"Fast-path /briefing: saved `{saved_path}`"
+        elif clean_cmd in {"/archive", "archive"}:
+            async with deps.inbox_lock:
+                archive_path, archived_count = await archive_inbox_transcript(
+                    obsidian=deps.obsidian,
+                    inbox_filename=deps.settings.inbox_filename,
+                    keep_recent_exchanges=2,
+                )
+            _sync_vault_index_immediately(deps)
+            if archive_path and archived_count > 0:
+                reply_text = (
+                    f"🗄️ **Inbox Archived Successfully**\n\n"
+                    f"- **Exchanges Archived:** {archived_count}\n"
+                    f"- **Archive File:** `{archive_path}`\n"
+                    f"- **Retained in Inbox:** Last 2 exchanges"
+                )
+            else:
+                reply_text = "🗄️ **Inbox is Already Compact** — fewer than 3 completed exchanges present."
+            tool_note = f"Fast-path /archive: archived {archived_count} exchanges"
+        elif clean_cmd in {"/clear", "clear", "/clear-inbox", "clear-inbox"}:
+            async with deps.inbox_lock:
+                await clear_inbox_page(
+                    obsidian=deps.obsidian,
+                    inbox_filename=deps.settings.inbox_filename,
+                )
+                try:
+                    await deps.obsidian.execute_command(
+                        "templater-obsidian:jump-to-next-cursor-location"
+                    )
+                except Exception:
+                    pass
+                if handler is not None:
+                    handler.record_agent_write(dispatched_command=command)
+            return "Cleared ISA_Inbox.md."
+        else:
+            count = _sync_vault_index_immediately(deps)
+            reply_text = (
+                f"🔄 **Vault Database Rescanned Successfully**\n\n"
+                f"- **Chunks Indexed:** {count}\n"
+                f"- **Store:** LanceDB (`{deps.settings.lancedb_uri}`)\n"
+                f"- **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            send_macos_notification(
+                title="ISA Database Rescanned",
+                subtitle=f"{count} chunks indexed",
+                message="LanceDB Hybrid memory updated successfully.",
+            )
+            tool_note = f"Fast-path /rescan: indexed {count} chunks"
+
         formatted_block = format_inbox_response(reply_text, include_next_prompt_stub=True)
         deps.context_window.add_entry(
             user_prompt=command,
             assistant_response=reply_text,
-            tool_context=[f"Fast-path /rescan: indexed {count} chunks"],
+            tool_context=[tool_note],
         )
         async with deps.inbox_lock:
             current = await deps.obsidian.get_note(deps.settings.inbox_filename)

@@ -15,7 +15,20 @@ RESPONSE_END_MARKER = "<!-- ISA_RESPONSE_END -->"
 THINKING_START_MARKER = "<!-- ISA_THINKING_START -->"
 CURSOR_PLACEHOLDER = "<% tp.file.cursor() %>"
 COMPLETE_SENTENCE_ENDINGS = (".", "?", "!", '"', "'", ")", "]")
-FAST_COMMANDS = {"/rescan", "rescan", "/reindex", "reindex"}
+FAST_COMMANDS = {
+    "/rescan",
+    "rescan",
+    "/reindex",
+    "reindex",
+    "/briefing",
+    "briefing",
+    "/archive",
+    "archive",
+    "/clear",
+    "clear",
+    "/clear-inbox",
+    "clear-inbox",
+}
 
 
 def extract_pending_command(

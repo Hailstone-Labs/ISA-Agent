@@ -16,7 +16,11 @@ from config.settings import enforce_airgap_env, get_settings
 from src.agent import ISADependencies, build_isa_agent, dispatch_inbox_command
 from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import LocalEmbedder
-from src.memory.vector_db import LocalVectorStore, ingest_vault_to_lancedb
+from src.memory.vector_db import (
+    LocalVectorStore,
+    ingest_vault_to_lancedb,
+    sync_single_vault_file_to_lancedb,
+)
 from src.monitor.observer import create_inbox_observer, extract_pending_command
 from src.tools.notifications import ActiveReminderMonitor
 from src.tools.obsidian import ObsidianRestClient
@@ -112,6 +116,33 @@ def clear_rolling_memory() -> None:
         settings.context_window_path,
         settings.context_window_size,
     )
+
+
+async def clear_obsidian_inbox() -> None:
+    """Wipe ISA_Inbox.md back to a clean slate with a fresh @ISA prompt line."""
+    from src.tools.documents import clear_inbox_page
+
+    settings = get_settings()
+    obsidian = ObsidianRestClient(settings)
+    try:
+        await clear_inbox_page(
+            obsidian=obsidian,
+            inbox_filename=settings.inbox_filename,
+        )
+        try:
+            await obsidian.execute_command(
+                "templater-obsidian:jump-to-next-cursor-location"
+            )
+        except Exception:
+            pass
+    except Exception:
+        # Fallback to direct file write if Obsidian REST API is not open
+        settings.inbox_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.inbox_path.write_text(
+            "# ISA Inbox\n\nType commands below using `@ISA`.\n\n@ISA \n",
+            encoding="utf-8",
+        )
+    logger.info("Cleared %s back to a clean slate.", settings.inbox_path)
 
 
 def run_ingestion() -> int:
@@ -298,23 +329,29 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
         loop.call_soon_threadsafe(command_queue.put_nowait, cmd)
 
     vault_reindex_lock = asyncio.Lock()
+    dirty_vault_files: set[Path] = set()
 
     def on_vault_file_changed(changed_path: Path) -> None:
+        dirty_vault_files.add(changed_path)
+
         async def _debounced_reindex() -> None:
             await asyncio.sleep(2.0)
             elapsed = time.monotonic() - handler.last_vault_edit_time
             if elapsed < 1.8:
                 return
             async with vault_reindex_lock:
-                try:
-                    count = ingest_vault_to_lancedb(
-                        settings=settings,
-                        embedder=embedder,
-                        vector_store=vector_store,
-                    )
-                    logger.info("Real-time LanceDB sync completed (%d chunks indexed)", count)
-                except Exception as exc:
-                    logger.debug("Background LanceDB sync failed: %s", exc)
+                paths_to_sync = list(dirty_vault_files)
+                dirty_vault_files.clear()
+                for p in paths_to_sync:
+                    try:
+                        sync_single_vault_file_to_lancedb(
+                            file_path=p,
+                            settings=settings,
+                            embedder=embedder,
+                            vector_store=vector_store,
+                        )
+                    except Exception as exc:
+                        logger.debug("Incremental LanceDB sync failed for %s: %s", p, exc)
 
         loop.call_soon_threadsafe(asyncio.create_task, _debounced_reindex())
 
@@ -437,6 +474,11 @@ def main() -> int:
         help="Clear the persisted rolling context window JSON before starting ISA.",
     )
     parser.add_argument(
+        "--clear-inbox",
+        action="store_true",
+        help="Clear ISA_Inbox.md back to a clean slate.",
+    )
+    parser.add_argument(
         "--manual-trigger",
         action="store_true",
         help="Trigger on pressing Enter (a newline) after the prompt, ignoring terminal punctuation.",
@@ -455,6 +497,8 @@ def main() -> int:
 
     if args.clear_memory:
         clear_rolling_memory()
+    if args.clear_inbox:
+        asyncio.run(clear_obsidian_inbox())
 
     if args.check:
         return asyncio.run(verify_sprint1_environment(write_hello=True))
@@ -465,7 +509,9 @@ def main() -> int:
     if args.once:
         return asyncio.run(process_once())
 
-    return asyncio.run(run_watchdog_daemon(memory_cleared=args.clear_memory))
+    return asyncio.run(
+        run_watchdog_daemon(memory_cleared=(args.clear_memory or args.clear_inbox))
+    )
 
 
 if __name__ == "__main__":

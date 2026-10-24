@@ -196,6 +196,21 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 @ISA Read my blog notes and create a synthesized executive overview at Reports/Blog Overview.md.
 ```
 
+#### F. Full Task & Calendar Lifecycle (Complete, Update, Reschedule, Cancel)
+```markdown
+@ISA Mark "Review the quarterly report" as completed.
+@ISA Move the "Call the accountant" task to next Wednesday and mark it high priority.
+@ISA Reschedule my Executive Strategy Meeting to 2026-10-28 from 15:00 to 16:00.
+```
+
+#### G. Instant Fast-Path Slash Commands (`< 1s`, No LLM Latency)
+```markdown
+@ISA /briefing   # Generates Briefings/YYYY-MM-DD - Executive Briefing.md combining today's events, tasks, and recent meetings
+@ISA /archive    # Archives older ISA_Inbox.md exchanges into Archive/ISA_Transcript_YYYY-MM.md (keeping the last 2 visible)
+@ISA /clear      # Wipes ISA_Inbox.md back to a completely clean slate with a fresh @ISA prompt line
+@ISA /rescan     # Forces a full vault LanceDB re-index with macOS desktop notification
+```
+
 ---
 
 ## 7. Semantic Memory & Hybrid RAG Pipeline
@@ -247,6 +262,9 @@ Open **`ISA_Inbox.md`** in Obsidian, type a command starting with `@ISA`, and **
 
 # Clear the rolling 10-entry context window (data/rolling_context.json) for a clean slate
 ./start_isa.sh --clear-memory
+
+# Clear the ISA_Inbox.md page back to a clean slate
+./start_isa.sh --clear-inbox
 
 # Start with manual trigger mode (triggers on pressing Enter after your prompt; ignores punctuation)
 ./start_isa.sh --manual-trigger

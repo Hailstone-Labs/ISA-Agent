@@ -10,8 +10,9 @@ from src.memory.context_window import RollingContextWindow, parse_inbox_entries
 from src.memory.ingest import MarkdownHeaderTextSplitter
 from src.memory.vector_db import (
     LocalVectorStore,
-     ingest_vault_to_lancedb,
+    ingest_vault_to_lancedb,
     reciprocal_rank_fusion,
+    sync_single_vault_file_to_lancedb,
 )
 
 
@@ -202,3 +203,42 @@ def test_sync_rolling_window_from_inbox_markdown() -> None:
     assert count == 10
     assert window.entries[0].user_prompt == "Prompt number 3"
     assert window.entries[-1].user_prompt == "Prompt number 12"
+
+
+def test_incremental_single_file_lancedb_sync(tmp_path) -> None:
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    note_a = vault_dir / "NoteA.md"
+    note_a.write_text("# Note A\nMarketing strategy overview.\n", encoding="utf-8")
+
+    settings = ISASettings(
+        OBSIDIAN_VAULT_PATH=vault_dir,
+        LANCEDB_URI=tmp_path / "lancedb",
+    )
+    embedder = DummyEmbedder()
+    store = LocalVectorStore(settings)
+
+    ingest_vault_to_lancedb(settings=settings, embedder=embedder, vector_store=store)
+    assert len(store.get_all_chunks()) == 1
+
+    # Add NoteB incrementally without re-ingesting NoteA
+    note_b = vault_dir / "NoteB.md"
+    note_b.write_text("# Note B\nSecret codename PROJECT-X99-OMEGA.\n", encoding="utf-8")
+    upserted = sync_single_vault_file_to_lancedb(
+        file_path=note_b,
+        settings=settings,
+        embedder=embedder,
+        vector_store=store,
+    )
+    assert upserted == 1
+    assert len(store.get_all_chunks()) == 2
+
+    # Delete NoteB from disk and sync its removal
+    note_b.unlink()
+    sync_single_vault_file_to_lancedb(
+        file_path=note_b,
+        settings=settings,
+        embedder=embedder,
+        vector_store=store,
+    )
+    assert len(store.get_all_chunks()) == 1

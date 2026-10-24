@@ -291,3 +291,141 @@ def test_calendar_listing_and_cancellation(tmp_path) -> None:
     assert len(events) == 1
     assert events[0]["title"] == "Project Sync"
     assert events[0]["date"] == "2026-10-25"
+
+
+@pytest.mark.anyio
+async def test_complete_and_update_task_and_reschedule_event(tmp_path) -> None:
+    from src.tools.calendar import reschedule_vault_calendar_event
+    from src.tools.documents import (
+        archive_inbox_transcript,
+        clear_inbox_page,
+        generate_daily_executive_briefing,
+    )
+    from src.tools.tasks import complete_vault_task, update_vault_task
+
+    class FakeObsidian:
+        def __init__(self, root):
+            self.root = root
+
+        async def get_note(self, path: str) -> str:
+            p = self.root / path.lstrip("/")
+            if not p.exists():
+                raise FileNotFoundError(path)
+            return p.read_text(encoding="utf-8")
+
+        async def create_or_overwrite_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        async def append_to_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            existing = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(existing + content, encoding="utf-8")
+
+        async def delete_note(self, path: str) -> None:
+            p = self.root / path.lstrip("/")
+            if p.exists():
+                p.unlink()
+
+        async def execute_command(self, cmd: str) -> None:
+            pass
+
+    obs = FakeObsidian(tmp_path)
+    await obs.create_or_overwrite_note(
+        "Tasks.md",
+        "# Tasks\n\n## Task List\n\n"
+        "- [ ] Review the quarterly report 📅 2026-10-24 ⏫\n"
+        "- [ ] Call the accountant 📅 2026-10-27 🔼\n",
+    )
+
+    # 1. Update task due date & priority
+    updated = await update_vault_task(
+        obsidian=obs,
+        description_query="Call the accountant",
+        new_due_date="2026-10-28",
+        new_priority="high",
+        notify=False,
+    )
+    assert updated == "- [ ] Call the accountant 📅 2026-10-28 ⏫"
+
+    # 2. Complete task
+    completed = await complete_vault_task(
+        obsidian=obs,
+        description_query="quarterly report",
+        completion_date="2026-10-23",
+        notify=False,
+    )
+    assert len(completed) == 1
+    assert completed[0].startswith("- [x] Review the quarterly report 📅 2026-10-24 ⏫ ✅ 2026-10-23")
+
+    # 3. Reschedule calendar event
+    cal_dir = tmp_path / "Calendar"
+    cal_dir.mkdir(exist_ok=True)
+    (cal_dir / "2026-10-24 - Strategy Sync.md").write_text(
+        "---\n"
+        "title: Strategy Sync\n"
+        "allDay: false\n"
+        "startTime: 10:00\n"
+        "endTime: 11:00\n"
+        "date: 2026-10-24\n"
+        "endDate: 2026-10-24\n"
+        "type: single\n"
+        "---\n"
+        "### Notes\nBring Q4 deck.\n",
+        encoding="utf-8",
+    )
+    res = await reschedule_vault_calendar_event(
+        obsidian=obs,
+        vault_path=tmp_path,
+        title_query="Strategy Sync",
+        new_date="2026-10-28",
+        new_start_time="14:00",
+        new_end_time="15:00",
+        notify=False,
+    )
+    assert res is not None
+    new_path, spec = res
+    assert new_path == "Calendar/2026-10-28 - Strategy Sync.md"
+    assert not (cal_dir / "2026-10-24 - Strategy Sync.md").exists()
+    assert (cal_dir / "2026-10-28 - Strategy Sync.md").exists()
+    assert spec.start_time == "14:00"
+    assert "Bring Q4 deck." in spec.agenda_or_notes
+
+    # 4. Generate Daily Executive Briefing
+    brief_path, brief_md = await generate_daily_executive_briefing(
+        obsidian=obs,
+        vault_root=tmp_path,
+        target_date="2026-10-28",
+        notify=False,
+    )
+    assert brief_path == "Briefings/2026-10-28 - Executive Briefing.md"
+    assert "Strategy Sync" in brief_md
+    assert "Call the accountant" in brief_md
+
+    # 5. Archive Inbox Transcript
+    inbox_content = "# ISA Inbox\n"
+    for i in range(1, 6):
+        inbox_content += f"\n@ISA Question {i}?\n" + format_inbox_response(f"Answer {i}")
+    await obs.create_or_overwrite_note("ISA_Inbox.md", inbox_content)
+
+    arch_path, arch_count = await archive_inbox_transcript(
+        obsidian=obs,
+        inbox_filename="ISA_Inbox.md",
+        keep_recent_exchanges=2,
+        notify=False,
+    )
+    assert arch_count == 3
+    assert arch_path is not None and arch_path.startswith("Archive/ISA_Transcript_")
+    remaining_inbox = await obs.get_note("ISA_Inbox.md")
+    assert "Question 4?" in remaining_inbox
+    assert "Question 5?" in remaining_inbox
+    assert "Question 1?" not in remaining_inbox
+
+    # 6. Clear Inbox Page
+    await clear_inbox_page(obsidian=obs, inbox_filename="ISA_Inbox.md", notify=False)
+    cleared_inbox = await obs.get_note("ISA_Inbox.md")
+    assert cleared_inbox.startswith("# ISA Inbox")
+    assert "Question 4?" not in cleared_inbox
+    assert "@ISA" in cleared_inbox
