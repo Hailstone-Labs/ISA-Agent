@@ -954,6 +954,13 @@ async def dispatch_inbox_command(
                 await deps.obsidian.execute_command("templater-obsidian:jump-to-next-cursor-location")
             except Exception:
                 pass
+
+            if clean_cmd.startswith(("/theme", "theme")):
+                try:
+                    await deps.obsidian.execute_command("app:reload")
+                except Exception:
+                    pass
+
             if handler is not None:
                 handler.record_agent_write(dispatched_command=command)
         return reply_text

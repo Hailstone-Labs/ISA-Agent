@@ -156,131 +156,250 @@ def get_theme(theme_name: str | None) -> ThemeConfig:
     return THEMES.get(norm, THEMES["default"])
 
 
-OBSIDIAN_THEMES_CSS = """/* ISA Custom Callout Themes: Retro CRT Terminal & Cyberpunk 2077 */
-
-/* ==========================================================================
-   1. RETRO CRT TERMINAL THEME (Phosphor Green / Deep Black)
+OBSIDIAN_THEMES_CSS = """/* ==========================================================================
+   ISA THEME ENGINE: RETRO CRT TERMINAL & CYBERPUNK 2077 FOR OBSIDIAN
+   Styles both Reading View and Live Preview Editor (CodeMirror 6)
    ========================================================================== */
-.callout[data-callout="isa-terminal"],
-.callout[data-callout="isa-terminal-thinking"] {
-    --callout-color: 0, 255, 102;
-    background-color: #030804 !important;
-    color: #00ff66 !important;
-    border: 1px solid #00ff66 !important;
-    border-radius: 4px !important;
-    box-shadow: 0 0 14px rgba(0, 255, 102, 0.3), inset 0 0 10px rgba(0, 255, 102, 0.08) !important;
-    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace !important;
-    position: relative;
-    overflow: hidden;
+
+/* --------------------------------------------------------------------------
+   1. RETRO CRT TERMINAL (Phosphor Green & Deep Pitch Black)
+   -------------------------------------------------------------------------- */
+:root {
+    --callout-isa-terminal-color: 0, 255, 102;
+    --callout-isa-terminal-icon: lucide-terminal;
+    --callout-isa-terminal-thinking-color: 0, 255, 102;
+    --callout-isa-terminal-thinking-icon: lucide-terminal;
 }
 
-/* Phosphor Scanline Texture Overlay */
-.callout[data-callout="isa-terminal"]::after,
-.callout[data-callout="isa-terminal-thinking"]::after {
+.callout[data-callout="isa-terminal"],
+.callout[data-callout="isa-terminal-thinking"],
+.cm-embed-block .callout[data-callout="isa-terminal"],
+.cm-embed-block .callout[data-callout="isa-terminal-thinking"],
+.markdown-rendered .callout[data-callout="isa-terminal"],
+.markdown-rendered .callout[data-callout="isa-terminal-thinking"] {
+    --callout-color: 0, 255, 102 !important;
+    --callout-icon: lucide-terminal !important;
+    background-color: #030804 !important;
+    background: radial-gradient(circle at 50% 50%, #051608 0%, #020703 100%) !important;
+    color: #00ff66 !important;
+    border: 1.5px solid #00ff66 !important;
+    border-radius: 4px !important;
+    box-shadow: 0 0 18px rgba(0, 255, 102, 0.42), inset 0 0 14px rgba(0, 255, 102, 0.15) !important;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Courier New', monospace !important;
+    position: relative !important;
+    overflow: hidden !important;
+    margin: 1.2em 0 !important;
+}
+
+/* CRT Scanlines Overlay */
+.callout[data-callout="isa-terminal"]::before,
+.callout[data-callout="isa-terminal-thinking"]::before {
     content: " ";
-    display: block;
-    position: absolute;
-    top: 0; left: 0; bottom: 0; right: 0;
-    background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%),
-                linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
-    z-index: 1;
-    background-size: 100% 3px, 6px 100%;
-    pointer-events: none;
-    opacity: 0.8;
+    display: block !important;
+    position: absolute !important;
+    top: 0 !important; left: 0 !important; bottom: 0 !important; right: 0 !important;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.38) 0px,
+        rgba(0, 0, 0, 0.38) 1px,
+        transparent 1px,
+        transparent 3px
+    ) !important;
+    z-index: 1 !important;
+    pointer-events: none !important;
+    opacity: 0.8 !important;
+}
+
+/* Terminal Title Bar */
+.callout[data-callout="isa-terminal"] .callout-title,
+.callout[data-callout="isa-terminal-thinking"] .callout-title,
+.callout[data-callout="isa-terminal"] .callout-title-inner,
+.callout[data-callout="isa-terminal-thinking"] .callout-title-inner {
+    color: #39ff14 !important;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.1em !important;
+    text-transform: uppercase !important;
+    text-shadow: 0 0 10px rgba(57, 255, 20, 0.9) !important;
+    z-index: 2 !important;
+    position: relative !important;
 }
 
 .callout[data-callout="isa-terminal"] .callout-title,
 .callout[data-callout="isa-terminal-thinking"] .callout-title {
+    border-bottom: 1px dashed rgba(0, 255, 102, 0.5) !important;
+    padding-bottom: 8px !important;
+    margin-bottom: 8px !important;
+}
+
+/* Terminal Icons */
+.callout[data-callout="isa-terminal"] .callout-icon,
+.callout[data-callout="isa-terminal-thinking"] .callout-icon,
+.callout[data-callout="isa-terminal"] .callout-icon svg,
+.callout[data-callout="isa-terminal-thinking"] .callout-icon svg {
     color: #39ff14 !important;
-    font-weight: 700 !important;
-    letter-spacing: 0.08em !important;
-    text-transform: uppercase !important;
-    border-bottom: 1px dashed rgba(0, 255, 102, 0.35) !important;
-    padding-bottom: 6px !important;
+    stroke: #39ff14 !important;
+    filter: drop-shadow(0 0 8px rgba(57, 255, 20, 0.95)) !important;
+    z-index: 2 !important;
 }
 
+/* ALL Child text elements inside Terminal callout MUST be phosphor green! */
 .callout[data-callout="isa-terminal"] .callout-content,
-.callout[data-callout="isa-terminal-thinking"] .callout-content {
+.callout[data-callout="isa-terminal-thinking"] .callout-content,
+.callout[data-callout="isa-terminal"] .callout-content *,
+.callout[data-callout="isa-terminal-thinking"] .callout-content * {
     color: #00ff66 !important;
-    line-height: 1.55 !important;
-    text-shadow: 0 0 5px rgba(0, 255, 102, 0.45) !important;
-    z-index: 2;
-    position: relative;
-}
-
-.callout[data-callout="isa-terminal"] code,
-.callout[data-callout="isa-terminal-thinking"] code {
-    background-color: #0c1a0e !important;
-    color: #66ff99 !important;
-    border: 1px solid rgba(0, 255, 102, 0.4) !important;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Courier New', monospace !important;
+    line-height: 1.6 !important;
+    text-shadow: 0 0 5px rgba(0, 255, 102, 0.5) !important;
+    z-index: 2 !important;
+    position: relative !important;
 }
 
 .callout[data-callout="isa-terminal"] strong,
 .callout[data-callout="isa-terminal-thinking"] strong {
     color: #70ff8b !important;
-    text-shadow: 0 0 6px rgba(112, 255, 139, 0.6) !important;
+    text-shadow: 0 0 8px rgba(112, 255, 139, 0.9) !important;
+    font-weight: 700 !important;
 }
 
-/* ==========================================================================
-   2. CYBERPUNK 2077 THEME (Night City / Netrunner Relic HUD)
-   ========================================================================== */
+.callout[data-callout="isa-terminal"] code,
+.callout[data-callout="isa-terminal-thinking"] code {
+    background-color: #091e0c !important;
+    color: #80ffaa !important;
+    border: 1px solid rgba(0, 255, 102, 0.6) !important;
+    border-radius: 2px !important;
+    padding: 2px 6px !important;
+    text-shadow: 0 0 6px rgba(0, 255, 102, 0.6) !important;
+}
+
+.callout[data-callout="isa-terminal"] a,
+.callout[data-callout="isa-terminal-thinking"] a {
+    color: #66ffb2 !important;
+    text-decoration: underline !important;
+}
+
+/* --------------------------------------------------------------------------
+   2. CYBERPUNK 2077 (Night City Netrunner Relic HUD)
+   -------------------------------------------------------------------------- */
+:root {
+    --callout-isa-cyberpunk-color: 0, 240, 255;
+    --callout-isa-cyberpunk-icon: lucide-zap;
+    --callout-isa-cyberpunk-thinking-color: 252, 238, 10;
+    --callout-isa-cyberpunk-thinking-icon: lucide-zap;
+}
+
 .callout[data-callout="isa-cyberpunk"],
-.callout[data-callout="isa-cyberpunk-thinking"] {
-    --callout-color: 252, 238, 10;
-    background-color: #0b0b14 !important;
+.callout[data-callout="isa-cyberpunk-thinking"],
+.cm-embed-block .callout[data-callout="isa-cyberpunk"],
+.cm-embed-block .callout[data-callout="isa-cyberpunk-thinking"],
+.markdown-rendered .callout[data-callout="isa-cyberpunk"],
+.markdown-rendered .callout[data-callout="isa-cyberpunk-thinking"] {
+    --callout-color: 0, 240, 255 !important;
+    --callout-icon: lucide-zap !important;
+    background-color: #0a0a13 !important;
+    background: linear-gradient(135deg, #0f0f1c 0%, #06060c 100%) !important;
     color: #fcee0a !important;
-    border: 1px solid #fcee0a !important;
-    border-left: 5px solid #00f0ff !important;
+    border-top: 2px solid #fcee0a !important;
+    border-bottom: 2.5px solid #00f0ff !important;
+    border-left: 6px solid #00f0ff !important;
     border-right: 3px solid #ff003c !important;
     border-radius: 0px !important;
-    clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
-    box-shadow: 0 0 18px rgba(0, 240, 255, 0.28), inset 0 0 15px rgba(255, 0, 60, 0.12) !important;
+    clip-path: polygon(0 0, calc(100% - 15px) 0, 100% 15px, 100% 100%, 15px 100%, 0 calc(100% - 15px)) !important;
+    box-shadow: 0 0 24px rgba(0, 240, 255, 0.4), 0 0 14px rgba(255, 0, 60, 0.25), inset 0 0 22px rgba(255, 0, 60, 0.12) !important;
     font-family: 'JetBrains Mono', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
-    position: relative;
-    overflow: hidden;
+    position: relative !important;
+    overflow: hidden !important;
+    margin: 1.2em 0 !important;
+}
+
+/* Cyberpunk Holographic Grid Texture Overlay */
+.callout[data-callout="isa-cyberpunk"]::before,
+.callout[data-callout="isa-cyberpunk-thinking"]::before {
+    content: " ";
+    display: block !important;
+    position: absolute !important;
+    top: 0 !important; left: 0 !important; bottom: 0 !important; right: 0 !important;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 240, 255, 0.05) 0px,
+        rgba(0, 240, 255, 0.05) 1px,
+        transparent 1px,
+        transparent 4px
+    ) !important;
+    z-index: 1 !important;
+    pointer-events: none !important;
+}
+
+/* Cyberpunk Title Bar */
+.callout[data-callout="isa-cyberpunk"] .callout-title,
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-title,
+.callout[data-callout="isa-cyberpunk"] .callout-title-inner,
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-title-inner {
+    color: #00f0ff !important;
+    font-weight: 900 !important;
+    letter-spacing: 0.15em !important;
+    text-transform: uppercase !important;
+    text-shadow: 0 0 12px rgba(0, 240, 255, 0.95), 0 0 22px rgba(0, 240, 255, 0.5) !important;
+    z-index: 2 !important;
+    position: relative !important;
 }
 
 .callout[data-callout="isa-cyberpunk"] .callout-title,
 .callout[data-callout="isa-cyberpunk-thinking"] .callout-title {
-    color: #00f0ff !important;
-    font-weight: 800 !important;
-    letter-spacing: 0.12em !important;
-    text-transform: uppercase !important;
-    text-shadow: 0 0 8px rgba(0, 240, 255, 0.7) !important;
-    border-bottom: 1px solid rgba(252, 238, 10, 0.4) !important;
-    padding-bottom: 6px !important;
+    border-bottom: 1.5px solid rgba(252, 238, 10, 0.6) !important;
+    padding-bottom: 8px !important;
+    margin-bottom: 8px !important;
 }
 
+/* Cyberpunk Icons */
+.callout[data-callout="isa-cyberpunk"] .callout-icon,
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-icon,
+.callout[data-callout="isa-cyberpunk"] .callout-icon svg,
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-icon svg {
+    color: #00f0ff !important;
+    stroke: #00f0ff !important;
+    filter: drop-shadow(0 0 10px rgba(0, 240, 255, 1)) !important;
+    z-index: 2 !important;
+}
+
+/* ALL Child text elements inside Cyberpunk callout */
 .callout[data-callout="isa-cyberpunk"] .callout-content,
-.callout[data-callout="isa-cyberpunk-thinking"] .callout-content {
-    color: #eceff4 !important;
-    line-height: 1.6 !important;
-    position: relative;
-    z-index: 2;
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-content,
+.callout[data-callout="isa-cyberpunk"] .callout-content *,
+.callout[data-callout="isa-cyberpunk-thinking"] .callout-content * {
+    color: #f0f4f8 !important;
+    line-height: 1.65 !important;
+    z-index: 2 !important;
+    position: relative !important;
 }
 
 .callout[data-callout="isa-cyberpunk"] strong,
 .callout[data-callout="isa-cyberpunk-thinking"] strong {
     color: #fcee0a !important;
-    text-shadow: 0 0 6px rgba(252, 238, 10, 0.5) !important;
+    text-shadow: 0 0 10px rgba(252, 238, 10, 0.9) !important;
+    font-weight: 800 !important;
 }
 
 .callout[data-callout="isa-cyberpunk"] em,
 .callout[data-callout="isa-cyberpunk-thinking"] em {
     color: #ff003c !important;
+    text-shadow: 0 0 8px rgba(255, 0, 60, 0.8) !important;
     font-style: italic !important;
 }
 
 .callout[data-callout="isa-cyberpunk"] code,
 .callout[data-callout="isa-cyberpunk-thinking"] code {
-    background-color: #171827 !important;
+    background-color: #17182b !important;
     color: #00f0ff !important;
-    border: 1px solid rgba(0, 240, 255, 0.4) !important;
+    border: 1px solid rgba(0, 240, 255, 0.6) !important;
     border-radius: 2px !important;
+    padding: 2px 6px !important;
+    text-shadow: 0 0 8px rgba(0, 240, 255, 0.8) !important;
 }
 
-.callout[data-callout="isa-cyberpunk"] a.internal-link,
-.callout[data-callout="isa-cyberpunk-thinking"] a.internal-link {
+.callout[data-callout="isa-cyberpunk"] a,
+.callout[data-callout="isa-cyberpunk-thinking"] a {
     color: #00f0ff !important;
     text-decoration: underline !important;
     text-decoration-color: #ff003c !important;
