@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 from typing import Literal
 from urllib.parse import urlparse
+import httpx
 from pydantic import ValidationError
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -105,6 +106,13 @@ def build_local_model(settings: ISASettings | None = None) -> OpenAIChatModel:
     return OpenAIChatModel(model_name=cfg.llm_model, provider=provider)
 
 
+def cleanup_stale_thinking_blocks(inbox_content: str) -> str:
+    """Remove any unclosed or orphaned thinking indicators left behind by previous crashed/restarted processes."""
+    if THINKING_START_MARKER not in inbox_content:
+        return inbox_content
+    return THINKING_BLOCK_REGEX.sub("", inbox_content).rstrip() + "\n"
+
+
 def format_thinking_block(
     command: str,
     status_line: str = "Analyzing request with local Gemma 4 12B...",
@@ -161,7 +169,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
     agent: Agent[ISADependencies, str] = Agent(
         model=model,
         deps_type=ISADependencies,
-        model_settings=ModelSettings(temperature=0.1),
+        model_settings=ModelSettings(temperature=0.1, timeout=90.0),
         system_prompt=(
             "You are ISA (Intelligent Secretary Assistant), an air-gapped executive assistant "
             "integrated directly into a local Obsidian vault. Provide concise, accurate, "

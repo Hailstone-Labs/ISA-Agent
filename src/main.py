@@ -17,6 +17,7 @@ from config.settings import enforce_airgap_env, get_settings
 from src.agent import (
     ISADependencies,
     build_isa_agent,
+    cleanup_stale_thinking_blocks,
     dispatch_inbox_command,
     dispatch_inline_note_command,
 )
@@ -432,6 +433,15 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     )
 
     if settings.inbox_path.exists():
+        try:
+            raw_inbox = settings.inbox_path.read_text(encoding="utf-8")
+            cleaned_inbox = cleanup_stale_thinking_blocks(raw_inbox)
+            if cleaned_inbox != raw_inbox:
+                settings.inbox_path.write_text(cleaned_inbox, encoding="utf-8")
+                logger.info("Cleaned up orphaned thinking block in %s from previous run.", settings.inbox_path)
+        except Exception as exc:
+            logger.debug("Could not clean up stale thinking blocks: %s", exc)
+
         initial_cmd = extract_pending_command(
             settings.inbox_path.read_text(encoding="utf-8"),
             require_newline=True,
