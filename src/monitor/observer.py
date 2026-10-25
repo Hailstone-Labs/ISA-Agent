@@ -30,13 +30,28 @@ FAST_COMMANDS = {
     "clear-inbox",
     "/theme",
     "theme",
+    "/import-calendar",
+    "import-calendar",
+    "/import-ics",
+    "import-ics",
 }
 
 
 def is_fast_command_str(cmd: str) -> bool:
-    """Return True if command is a recognized slash command or theme switch."""
+    """Return True if command is a recognized slash command, theme switch, or calendar import."""
     low = cmd.strip().lower()
-    return low in FAST_COMMANDS or low.startswith(("/theme ", "theme "))
+    return (
+        low in FAST_COMMANDS
+        or low.startswith(("/theme ", "theme "))
+        or low.startswith(
+            (
+                "/import-calendar",
+                "import-calendar",
+                "/import-ics",
+                "import-ics",
+            )
+        )
+    )
 
 
 def extract_pending_command(
@@ -104,7 +119,7 @@ def extract_pending_command(
     return command
 
 
-EXCLUDED_INLINE_DIRS = {"archive", "briefings", "templates", "calendar"}
+EXCLUDED_INLINE_DIRS = {"archive", "briefings", "templates", "calendar", "imports"}
 EXCLUDED_INLINE_FILENAMES = {"tasks.md"}
 
 
@@ -166,6 +181,8 @@ class InboxEventHandler(FileSystemEventHandler):
         manual_trigger_only: bool = False,
         on_vault_change: Callable[[Path], None] | None = None,
         on_inline_command: Callable[[Path, str], None] | None = None,
+        calendar_import_folder: str = "Imports/Calendar",
+        on_calendar_file_dropped: Callable[[Path], None] | None = None,
     ) -> None:
         super().__init__()
         self.inbox_path = inbox_path.resolve()
@@ -177,10 +194,13 @@ class InboxEventHandler(FileSystemEventHandler):
         self.manual_trigger_only = manual_trigger_only
         self.on_vault_change = on_vault_change
         self.on_inline_command = on_inline_command
+        self.calendar_import_folder = calendar_import_folder
+        self.on_calendar_file_dropped = on_calendar_file_dropped
         self._last_hash: str | None = self._compute_hash()
         self._last_agent_write_time: float = 0.0
         self._last_command_hash: str | None = None
         self._last_inline_command_hashes: dict[Path, str] = {}
+        self._last_ics_hashes: dict[Path, str] = {}
         self.last_user_edit_time: float = 0.0
         self.last_vault_edit_time: float = 0.0
 
@@ -307,9 +327,36 @@ class InboxEventHandler(FileSystemEventHandler):
         self._last_inline_command_hashes[md_path] = cmd_hash
         self.on_inline_command(md_path, cmd)
 
+    def _is_calendar_import_file(self, path_bytes_or_str: bytes | str) -> Path | None:
+        """Return resolved Path if the event is an .ics file inside the calendar import folder."""
+        p = Path(os.fsdecode(path_bytes_or_str)).resolve()
+        if p.suffix.lower() not in {".ics", ".ical"}:
+            return None
+        try:
+            rel_parts = p.relative_to(self.vault_root).parts
+        except ValueError:
+            return None
+        clean_import = self.calendar_import_folder.strip("/").lower()
+        import_top = clean_import.split("/")[0]
+        if rel_parts and rel_parts[0].lower() == import_top:
+            return p
+        return None
+
     def _handle_fs_path(self, path_bytes_or_str: bytes | str) -> None:
         if self._matches_inbox(path_bytes_or_str):
             self._check_and_dispatch()
+            return
+        cal_path = self._is_calendar_import_file(path_bytes_or_str)
+        if cal_path is not None and self.on_calendar_file_dropped is not None:
+            if cal_path.exists():
+                try:
+                    cal_data = cal_path.read_bytes()
+                    cal_hash = hashlib.md5(cal_data).hexdigest()
+                except OSError:
+                    cal_hash = None
+                if cal_hash and self._last_ics_hashes.get(cal_path) != cal_hash:
+                    self._last_ics_hashes[cal_path] = cal_hash
+                    self.on_calendar_file_dropped(cal_path)
             return
         md_path = self._is_vault_markdown_note(path_bytes_or_str)
         if md_path is not None:
@@ -344,6 +391,8 @@ def create_inbox_observer(
     manual_trigger_only: bool = False,
     on_vault_change: Callable[[Path], None] | None = None,
     on_inline_command: Callable[[Path, str], None] | None = None,
+    calendar_import_folder: str = "Imports/Calendar",
+    on_calendar_file_dropped: Callable[[Path], None] | None = None,
 ) -> tuple[Observer, InboxEventHandler]:
     """Instantiate a watchdog Observer watching the Obsidian vault directory recursively."""
     inbox_path = inbox_path.resolve()
@@ -359,6 +408,8 @@ def create_inbox_observer(
         manual_trigger_only=manual_trigger_only,
         on_vault_change=on_vault_change,
         on_inline_command=on_inline_command,
+        calendar_import_folder=calendar_import_folder,
+        on_calendar_file_dropped=on_calendar_file_dropped,
     )
     observer = Observer()
     observer.schedule(handler, str(inbox_path.parent), recursive=True)

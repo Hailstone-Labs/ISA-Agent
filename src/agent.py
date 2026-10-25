@@ -37,6 +37,11 @@ from src.tools.calendar import (
     list_vault_calendar_events,
     reschedule_vault_calendar_event,
 )
+from src.tools.calendar_import import (
+    CalendarImportResult,
+    import_ics_file_to_vault,
+    parse_ics_file,
+)
 from src.tools.documents import (
     SynthesizedDocumentSpec,
     archive_inbox_transcript,
@@ -677,6 +682,98 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         )
 
     @agent.tool
+    async def import_calendar_file(
+        ctx: RunContext[ISADependencies],
+        file_path_or_query: str = "",
+    ) -> str:
+        """Import an Outlook or Microsoft Teams iCalendar (.ics) export file into Obsidian Full Calendar.
+
+        Extracts meeting titles, dates, 24h start/end times, attendees, organizers, locations,
+        and Teams join links, generating individual notes in `Calendar/` with automatic deduplication.
+
+        Args:
+            file_path_or_query: Optional path to an .ics file. If omitted or empty, imports all .ics files in `Imports/Calendar/`.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"📅 Importing calendar events from `{file_path_or_query or 'Imports/Calendar'}`..."
+        )
+        import_dir = (
+            ctx.deps.settings.obsidian_vault_path
+            / ctx.deps.settings.calendar_import_folder.strip("/")
+        )
+        import_dir.mkdir(parents=True, exist_ok=True)
+
+        target_file: Path | None = None
+        clean_target = file_path_or_query.strip().strip("'\"")
+
+        if clean_target:
+            p = Path(clean_target)
+            if not p.is_absolute():
+                p = (ctx.deps.settings.obsidian_vault_path / clean_target).resolve()
+            if p.exists() and p.is_file():
+                target_file = p
+            elif (import_dir / clean_target).exists():
+                target_file = (import_dir / clean_target).resolve()
+            else:
+                return (
+                    f"Calendar file `{clean_target}` was not found. Please verify the file path "
+                    f"or place the `.ics` file into `{ctx.deps.settings.calendar_import_folder}/`."
+                )
+
+        files_to_process = (
+            [target_file]
+            if target_file
+            else sorted(list(import_dir.glob("*.ics")) + list(import_dir.glob("*.ical")))
+        )
+
+        if not files_to_process:
+            return (
+                f"No `.ics` files found in `{ctx.deps.settings.calendar_import_folder}/`. "
+                f"Please drop an Outlook or Teams `.ics` export file into that directory."
+            )
+
+        total_created = 0
+        total_updated = 0
+        total_skipped = 0
+        total_events = 0
+        all_files: list[str] = []
+        all_errors: list[str] = []
+
+        for ics_p in files_to_process:
+            try:
+                res = await import_ics_file_to_vault(
+                    obsidian=ctx.deps.obsidian,
+                    vault_root=ctx.deps.settings.obsidian_vault_path,
+                    ics_path=ics_p,
+                    calendar_folder=ctx.deps.settings.calendar_folder,
+                    notify=True,
+                )
+                total_created += res.created
+                total_updated += res.updated
+                total_skipped += res.skipped
+                total_events += res.total_events
+                all_files.extend(res.imported_files)
+                all_errors.extend(res.errors)
+            except Exception as exc:
+                all_errors.append(f"{ics_p.name}: {exc}")
+
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(
+            f"Imported calendar: {total_created} created, {total_updated} updated, {total_skipped} skipped"
+        )
+        summary = CalendarImportResult(
+            created=total_created,
+            updated=total_updated,
+            skipped=total_skipped,
+            total_events=total_events,
+            imported_files=all_files,
+            errors=all_errors,
+        )
+        return summary.summary_markdown(
+            filename=files_to_process[0].name if len(files_to_process) == 1 else ""
+        )
+
+    @agent.tool
     async def generate_daily_briefing(
         ctx: RunContext[ISADependencies],
         target_date: str | None = None,
@@ -817,9 +914,9 @@ async def dispatch_inbox_command(
             persist_path=deps.settings.context_window_path,
         )
 
-    # Fast-path for deterministic commands like /rescan, /briefing, /archive, /clear, and /theme
+    # Fast-path for deterministic commands like /rescan, /briefing, /archive, /clear, /theme, and /import-calendar
     clean_cmd = command.strip().lower()
-    if clean_cmd in FAST_COMMANDS or clean_cmd.startswith(("/theme", "theme")):
+    if is_fast_command_str(command):
         logger.info("Executing fast-path command: %s", clean_cmd)
         if clean_cmd.startswith(("/theme", "theme")):
             parts = clean_cmd.split(maxsplit=1)
@@ -924,6 +1021,75 @@ async def dispatch_inbox_command(
                 if handler is not None:
                     handler.record_agent_write(dispatched_command=command)
             return "Cleared ISA_Inbox.md."
+        elif clean_cmd.startswith(("/import-calendar", "import-calendar", "/import-ics", "import-ics")):
+            raw_target = command.strip().split(maxsplit=1)[1].strip().strip("'\"") if " " in command.strip() else ""
+            import_dir = (
+                deps.settings.obsidian_vault_path
+                / deps.settings.calendar_import_folder.strip("/")
+            )
+            import_dir.mkdir(parents=True, exist_ok=True)
+
+            files_to_import: list[Path] = []
+            if raw_target:
+                p = Path(raw_target)
+                if not p.is_absolute():
+                    p = (deps.settings.obsidian_vault_path / raw_target).resolve()
+                if p.exists() and p.is_file():
+                    files_to_import.append(p)
+                elif (import_dir / raw_target).exists():
+                    files_to_import.append((import_dir / raw_target).resolve())
+                else:
+                    reply_text = (
+                        f"❌ **Calendar file not found:** `{raw_target}`\n\n"
+                        f"Please ensure the file exists or place it into `{deps.settings.calendar_import_folder}/`."
+                    )
+                    files_to_import = []
+            else:
+                files_to_import = sorted(list(import_dir.glob("*.ics")) + list(import_dir.glob("*.ical")))
+
+            if files_to_import:
+                total_created = 0
+                total_updated = 0
+                total_skipped = 0
+                total_events = 0
+                all_files: list[str] = []
+                all_errors: list[str] = []
+
+                for ics_file in files_to_import:
+                    res = await import_ics_file_to_vault(
+                        obsidian=deps.obsidian,
+                        vault_root=deps.settings.obsidian_vault_path,
+                        ics_path=ics_file,
+                        calendar_folder=deps.settings.calendar_folder,
+                        notify=True,
+                    )
+                    total_created += res.created
+                    total_updated += res.updated
+                    total_skipped += res.skipped
+                    total_events += res.total_events
+                    all_files.extend(res.imported_files)
+                    all_errors.extend(res.errors)
+
+                _sync_vault_index_immediately(deps)
+                summary_obj = CalendarImportResult(
+                    created=total_created,
+                    updated=total_updated,
+                    skipped=total_skipped,
+                    total_events=total_events,
+                    imported_files=all_files,
+                    errors=all_errors,
+                )
+                reply_text = summary_obj.summary_markdown(
+                    filename=files_to_import[0].name if len(files_to_import) == 1 else ""
+                )
+            elif not raw_target:
+                reply_text = (
+                    f"ℹ️ **No `.ics` calendar files found** in `{deps.settings.calendar_import_folder}`.\n\n"
+                    f"To import calendar events:\n"
+                    f"1. Save your Outlook or Teams `.ics` export file into `{deps.settings.calendar_import_folder}/`\n"
+                    f"2. Or run `@ISA /import-calendar <path-to-file.ics>`"
+                )
+            tool_note = f"Fast-path /import-calendar: processed {len(files_to_import)} files"
         else:
             count = _sync_vault_index_immediately(deps)
             reply_text = (

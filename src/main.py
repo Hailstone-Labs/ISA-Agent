@@ -33,6 +33,7 @@ from src.theme import ensure_obsidian_themes_snippet, get_theme
 from src.tools.documents import generate_daily_executive_briefing
 from src.tools.notifications import ActiveReminderMonitor
 from src.tools.obsidian import ObsidianRestClient
+from src.tools.calendar_import import import_ics_file_to_vault
 
 logging.basicConfig(
     level=logging.INFO,
@@ -413,6 +414,42 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
 
         loop.call_soon_threadsafe(asyncio.create_task, _debounced_inline_dispatch())
 
+    calendar_import_dir = (
+        settings.obsidian_vault_path / settings.calendar_import_folder.strip("/")
+    )
+    calendar_import_dir.mkdir(parents=True, exist_ok=True)
+    calendar_import_lock = asyncio.Lock()
+
+    def on_calendar_file_dropped(cal_path: Path) -> None:
+        async def _debounced_calendar_import() -> None:
+            await asyncio.sleep(1.0)
+            async with calendar_import_lock:
+                try:
+                    logger.info("Auto-importing calendar file dropped at %s...", cal_path)
+                    res = await import_ics_file_to_vault(
+                        obsidian=obsidian,
+                        vault_root=settings.obsidian_vault_path,
+                        ics_path=cal_path,
+                        calendar_folder=settings.calendar_folder,
+                        notify=True,
+                    )
+                    ingest_vault_to_lancedb(
+                        settings=settings,
+                        embedder=embedder,
+                        vector_store=vector_store,
+                    )
+                    logger.info(
+                        "Calendar auto-import complete (%s): created=%d, updated=%d, skipped=%d",
+                        cal_path.name,
+                        res.created,
+                        res.updated,
+                        res.skipped,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to auto-import calendar file %s: %s", cal_path, exc)
+
+        loop.call_soon_threadsafe(asyncio.create_task, _debounced_calendar_import())
+
     observer, handler = create_inbox_observer(
         inbox_path=settings.inbox_path,
         on_user_command=on_command_detected,
@@ -421,6 +458,8 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
         manual_trigger_only=settings.manual_trigger_only,
         on_vault_change=on_vault_file_changed,
         on_inline_command=on_inline_command_detected,
+        calendar_import_folder=settings.calendar_import_folder,
+        on_calendar_file_dropped=on_calendar_file_dropped,
     )
     observer.start()
     mode_desc = "MANUAL (Single Enter / newline; punctuation ignored)" if settings.manual_trigger_only else "AUTO (Punctuation [.!?] + Enter OR Enter twice)"
@@ -515,6 +554,46 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     return 0
 
 
+async def run_cli_calendar_import(ics_path: str) -> int:
+    """Import an iCalendar file directly from the CLI and re-index into LanceDB."""
+    enforce_airgap_env()
+    settings = get_settings()
+    vector_store = LocalVectorStore(settings)
+    embedder = LocalEmbedder()
+    obsidian = ObsidianRestClient(settings)
+
+    p = Path(ics_path)
+    if not p.is_absolute():
+        p = (settings.obsidian_vault_path / ics_path).resolve()
+    if not p.exists():
+        alt = (
+            settings.obsidian_vault_path
+            / settings.calendar_import_folder.strip("/")
+            / ics_path
+        ).resolve()
+        if alt.exists():
+            p = alt
+        else:
+            logger.error("Calendar file not found: %s", ics_path)
+            return 1
+
+    logger.info("Importing calendar file: %s ...", p)
+    res = await import_ics_file_to_vault(
+        obsidian=obsidian,
+        vault_root=settings.obsidian_vault_path,
+        ics_path=p,
+        calendar_folder=settings.calendar_folder,
+        notify=True,
+    )
+    ingest_vault_to_lancedb(
+        settings=settings,
+        embedder=embedder,
+        vector_store=vector_store,
+    )
+    print(res.summary_markdown(filename=p.name))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Intelligent Secretary Assistant (ISA)")
     parser.add_argument(
@@ -562,6 +641,12 @@ def main() -> int:
         choices=["default", "terminal", "cyberpunk"],
         help="Select visual & persona theme ('default', 'terminal', 'cyberpunk').",
     )
+    parser.add_argument(
+        "--import-calendar",
+        type=str,
+        metavar="ICS_PATH",
+        help="Import an Outlook or MS Teams .ics calendar file into the vault and exit.",
+    )
     args = parser.parse_args()
 
     if args.theme:
@@ -577,6 +662,8 @@ def main() -> int:
     if args.clear_inbox:
         asyncio.run(clear_obsidian_inbox())
 
+    if args.import_calendar:
+        return asyncio.run(run_cli_calendar_import(args.import_calendar))
     if args.check:
         return asyncio.run(verify_sprint1_environment(write_hello=True))
     if args.ingest:

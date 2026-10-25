@@ -65,6 +65,9 @@ class ISASettings(BaseSettings):
     calendar_folder: str = Field(
         default="Calendar", alias="ISA_CALENDAR_FOLDER"
     )
+    calendar_import_folder: str = Field(
+        default="Imports/Calendar", alias="ISA_CALENDAR_IMPORT_FOLDER"
+    )
     debounce_seconds: float = Field(default=1.0, alias="ISA_DEBOUNCE_SECONDS")
     manual_trigger_only: bool = Field(
         default=False,

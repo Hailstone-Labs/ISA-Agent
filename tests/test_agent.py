@@ -400,3 +400,82 @@ async def test_theme_slash_command_switching(tmp_path) -> None:
     assert "CRT TERMINAL THEME ACTIVATED" in reply_term
     assert deps.settings.isa_theme == "terminal"
     assert (tmp_path / "isa_theme.txt").read_text(encoding="utf-8") == "terminal"
+
+
+@pytest.mark.anyio
+async def test_import_calendar_fast_command(tmp_path) -> None:
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    inbox_file = vault_dir / "ISA_Inbox.md"
+    inbox_file.write_text("# ISA Inbox\n\n@ISA /import-calendar\n", encoding="utf-8")
+
+    import_dir = vault_dir / "Imports" / "Calendar"
+    import_dir.mkdir(parents=True)
+
+    ics_content = (
+        "BEGIN:VCALENDAR\n"
+        "VERSION:2.0\n"
+        "BEGIN:VEVENT\n"
+        "UID:FAST-CMD-UID-999\n"
+        "DTSTART:20261029T150000\n"
+        "DTEND:20261029T160000\n"
+        "SUMMARY:Fast Path Sync\n"
+        "DESCRIPTION:Discuss import architecture: https://teams.microsoft.com/l/meetup-join/fastpath123\n"
+        "LOCATION:Microsoft Teams\n"
+        "END:VEVENT\n"
+        "END:VCALENDAR\n"
+    )
+    (import_dir / "meeting.ics").write_text(ics_content, encoding="utf-8")
+
+    class DummyClient:
+        def __init__(self, root):
+            self.root = root
+
+        async def get_note(self, path: str) -> str:
+            p = self.root / path.lstrip("/")
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        async def create_or_overwrite_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        async def append_to_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            existing = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(existing + content, encoding="utf-8")
+
+        async def delete_note(self, path: str) -> None:
+            p = self.root / path.lstrip("/")
+            if p.exists():
+                p.unlink()
+
+        async def execute_command(self, cmd: str) -> None:
+            pass
+
+    settings = ISASettings(
+        OBSIDIAN_VAULT_PATH=vault_dir,
+        LANCEDB_URI=tmp_path / "lancedb",
+    )
+    deps = ISADependencies(
+        settings=settings,
+        obsidian=DummyClient(vault_dir),
+        embedder=DummyEmbedder(),
+    )
+
+    # First run: imports meeting.ics
+    reply = await dispatch_inbox_command(command="/import-calendar", deps=deps)
+    assert "Calendar Import Complete" in reply
+    assert "**New Events Created:** 1" in reply
+
+    created_notes = list((vault_dir / "Calendar").glob("*.md"))
+    assert len(created_notes) == 1
+    content = created_notes[0].read_text(encoding="utf-8")
+    assert "Fast Path Sync" in content
+    assert "https://teams.microsoft.com/l/meetup-join/fastpath123" in content
+
+    # Second run: identical file is skipped
+    reply2 = await dispatch_inbox_command(command="/import-calendar", deps=deps)
+    assert "Calendar Import Complete" in reply2
+    assert "**Unchanged (Skipped):** 1" in reply2
+

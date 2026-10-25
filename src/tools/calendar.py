@@ -48,6 +48,12 @@ class CalendarEventSpec(BaseModel):
     agenda_or_notes: str = Field(
         default="", description="Optional Markdown body / agenda below YAML frontmatter"
     )
+    uid: str | None = Field(
+        default=None, description="Unique identifier for calendar sync and deduplication"
+    )
+    source: str | None = Field(
+        default=None, description="Origin source for imported calendar events (e.g. 'outlook')"
+    )
 
     @field_validator("date")
     @classmethod
@@ -108,9 +114,13 @@ class CalendarEventSpec(BaseModel):
                 f"date: {self.date}",
                 f"endDate: {self.end_date or self.date}",
                 f"type: {self.event_type}",
-                "---",
             ]
         )
+        if self.uid:
+            lines.append(f"uid: {self.uid}")
+        if self.source:
+            lines.append(f"source: {self.source}")
+        lines.append("---")
         body = self.agenda_or_notes.strip()
         if body:
             lines.append(body)
