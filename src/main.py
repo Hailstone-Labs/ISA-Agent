@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import resource
 import signal
+import sys
 import time
 import httpx
 from config.settings import enforce_airgap_env, get_settings
@@ -28,7 +29,11 @@ from src.memory.vector_db import (
     ingest_vault_to_lancedb,
     sync_single_vault_file_to_lancedb,
 )
-from src.monitor.observer import create_inbox_observer, extract_pending_command
+from src.monitor.observer import (
+    create_inbox_observer,
+    extract_pending_command,
+    schedule_source_code_watcher,
+)
 from src.theme import ensure_obsidian_themes_snippet, get_theme
 from src.tools.documents import generate_daily_executive_briefing
 from src.tools.notifications import ActiveReminderMonitor
@@ -354,6 +359,7 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
     loop = asyncio.get_running_loop()
     command_queue: asyncio.Queue[str] = asyncio.Queue()
     stop_event = asyncio.Event()
+    reload_event = asyncio.Event()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -461,6 +467,32 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
         calendar_import_folder=settings.calendar_import_folder,
         on_calendar_file_dropped=on_calendar_file_dropped,
     )
+
+    project_root = Path(__file__).resolve().parent.parent
+    last_source_edit_time = 0.0
+
+    def on_source_file_changed(py_path: Path) -> None:
+        nonlocal last_source_edit_time
+        last_source_edit_time = time.monotonic()
+
+        async def _debounced_hot_reload() -> None:
+            await asyncio.sleep(1.5)
+            if time.monotonic() - last_source_edit_time < 1.3:
+                return
+            logger.info(
+                "🔄 Source code modification detected in %s — triggering hot-reload...",
+                py_path.name,
+            )
+            reload_event.set()
+
+        loop.call_soon_threadsafe(asyncio.create_task, _debounced_hot_reload())
+
+    schedule_source_code_watcher(
+        observer=observer,
+        watch_dirs=[project_root / "src", project_root / "config"],
+        on_source_changed=on_source_file_changed,
+    )
+
     observer.start()
     mode_desc = "MANUAL (Single Enter / newline; punctuation ignored)" if settings.manual_trigger_only else "AUTO (Punctuation [.!?] + Enter OR Enter twice)"
     logger.info(
@@ -491,11 +523,12 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
 
     reminder_task = asyncio.create_task(periodic_reminder_loop())
     try:
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not reload_event.is_set():
             queue_task = asyncio.create_task(command_queue.get())
             stop_task = asyncio.create_task(stop_event.wait())
+            reload_task = asyncio.create_task(reload_event.wait())
             done, pending = await asyncio.wait(
-                {queue_task, stop_task},
+                {queue_task, stop_task, reload_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
@@ -538,6 +571,8 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
                             handler=handler,
                             agent=agent,
                         )
+                        if deps.restart_requested:
+                            reload_event.set()
                 except Exception as exc:
                     logger.exception("Error processing @ISA command: %s", exc)
     finally:
@@ -549,6 +584,9 @@ async def run_watchdog_daemon(memory_cleared: bool = False) -> int:
             lock_file.close()
         except Exception:
             pass
+        if reload_event.is_set() and not stop_event.is_set():
+            logger.info("🔄 Hot-reloading ISA daemon process via os.execv...")
+            os.execv(sys.executable, [sys.executable, "-m", "src.main", *sys.argv[1:]])
         logger.info("Watchdog daemon stopped cleanly.")
 
     return 0

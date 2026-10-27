@@ -690,3 +690,31 @@ def test_unbacked_write_claim_detection_regex() -> None:
     assert not USER_DOC_MUTATION_INTENT_RE.search("What is in the Blog Overview note?")
 
 
+def test_source_code_hot_reload_handler_and_restart_command(tmp_path) -> None:
+    from src.monitor.observer import SourceCodeReloadHandler, is_fast_command_str
+
+    assert is_fast_command_str("/restart")
+    assert is_fast_command_str("restart")
+    assert is_fast_command_str("/reload")
+    assert is_fast_command_str("reload")
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    mod_file = src_dir / "module.py"
+    mod_file.write_text("x = 1\n", encoding="utf-8")
+
+    triggered: list[str] = []
+    handler = SourceCodeReloadHandler(on_source_changed=lambda p: triggered.append(p.name))
+    handler.seed_initial_hashes([src_dir])
+
+    # Unchanged content should NOT trigger reload
+    handler._check_py_path(str(mod_file))
+    assert triggered == []
+
+    # Modified content MUST trigger reload
+    mod_file.write_text("x = 2\n", encoding="utf-8")
+    handler._check_py_path(str(mod_file))
+    assert triggered == ["module.py"]
+
+
+

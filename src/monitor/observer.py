@@ -34,6 +34,10 @@ FAST_COMMANDS = {
     "import-calendar",
     "/import-ics",
     "import-ics",
+    "/restart",
+    "restart",
+    "/reload",
+    "reload",
 }
 
 
@@ -414,3 +418,74 @@ def create_inbox_observer(
     observer = Observer()
     observer.schedule(handler, str(inbox_path.parent), recursive=True)
     return observer, handler
+
+
+class SourceCodeReloadHandler(FileSystemEventHandler):
+    """Watches Python source directories (`src/`, `config/`) for real content edits to trigger hot-reload."""
+
+    def __init__(self, on_source_changed: Callable[[Path], None]) -> None:
+        super().__init__()
+        self.on_source_changed = on_source_changed
+        self._file_hashes: dict[Path, str] = {}
+
+    def seed_initial_hashes(self, directories: list[Path]) -> None:
+        """Record baseline MD5 hashes of existing .py files so only genuine edits trigger reload."""
+        for directory in directories:
+            if not directory.exists():
+                continue
+            for py_file in directory.rglob("*.py"):
+                if "__pycache__" in py_file.parts:
+                    continue
+                try:
+                    resolved = py_file.resolve()
+                    self._file_hashes[resolved] = hashlib.md5(
+                        resolved.read_bytes()
+                    ).hexdigest()
+                except OSError:
+                    pass
+
+    def _check_py_path(self, path_bytes_or_str: bytes | str) -> None:
+        p = Path(os.fsdecode(path_bytes_or_str))
+        if p.suffix.lower() != ".py" or "__pycache__" in p.parts:
+            return
+        try:
+            resolved = p.resolve()
+            if not resolved.exists():
+                if resolved in self._file_hashes:
+                    del self._file_hashes[resolved]
+                    self.on_source_changed(resolved)
+                return
+            new_hash = hashlib.md5(resolved.read_bytes()).hexdigest()
+        except OSError:
+            return
+
+        if self._file_hashes.get(resolved) != new_hash:
+            self._file_hashes[resolved] = new_hash
+            self.on_source_changed(resolved)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._check_py_path(event.src_path)
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._check_py_path(event.src_path)
+
+    def on_moved(self, event: FileMovedEvent) -> None:
+        if not event.is_directory:
+            self._check_py_path(event.dest_path)
+
+
+def schedule_source_code_watcher(
+    observer: Observer,
+    watch_dirs: list[Path],
+    on_source_changed: Callable[[Path], None],
+) -> SourceCodeReloadHandler:
+    """Attach a SourceCodeReloadHandler to an existing Watchdog Observer for hot-reloading."""
+    reload_handler = SourceCodeReloadHandler(on_source_changed=on_source_changed)
+    reload_handler.seed_initial_hashes(watch_dirs)
+    for d in watch_dirs:
+        if d.exists() and d.is_dir():
+            observer.schedule(reload_handler, str(d.resolve()), recursive=True)
+    return reload_handler
+

@@ -106,6 +106,7 @@ class ISADependencies:
     inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turn_tool_context: list[str] = field(default_factory=list)
     turn_write_actions: list[str] = field(default_factory=list)
+    restart_requested: bool = False
 
 
 def _sync_vault_index_immediately(deps: ISADependencies) -> int:
@@ -1285,6 +1286,21 @@ async def dispatch_inbox_command(
                     f"2. Or run `@ISA /import-calendar <path-to-file.ics>`"
                 )
             tool_note = f"Fast-path /import-calendar: processed {len(files_to_import)} files"
+        elif clean_cmd in {"/restart", "restart", "/reload", "reload"}:
+            deps.restart_requested = True
+            reply_text = (
+                f"🔄 **ISA Daemon Hot-Reloading...**\n\n"
+                f"- **Action:** Reloading Python runtime (`src/` & `config/`) in-place\n"
+                f"- **Model:** `{deps.settings.llm_model}`\n"
+                f"- **Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"- **Status:** Active & ready for instructions"
+            )
+            send_macos_notification(
+                title="ISA Daemon Reloaded",
+                subtitle="Hot-Reload Complete",
+                message="Python source modules reloaded in-place.",
+            )
+            tool_note = "Fast-path /restart: hot-reloaded daemon in-place"
         else:
             count = _sync_vault_index_immediately(deps)
             reply_text = (

@@ -39,4 +39,26 @@ if [[ $# -eq 0 ]]; then
   fi
 fi
 
-exec .venv/bin/python -m src.main "${ARGS[@]}"
+# Strip --restart flag if provided and stop any existing daemon instance when launching the daemon
+FILTERED_ARGS=()
+IS_ONE_SHOT=0
+for arg in "${ARGS[@]}"; do
+  if [[ "${arg}" == "--restart" ]]; then
+    continue
+  fi
+  if [[ "${arg}" == "--check" || "${arg}" == "--once" || "${arg}" == "--ingest" || "${arg}" == "--profile" || "${arg}" == "--import-calendar" || "${arg}" == "--help" || "${arg}" == "-h" ]]; then
+    IS_ONE_SHOT=1
+  fi
+  FILTERED_ARGS+=("${arg}")
+done
+
+if [[ "${IS_ONE_SHOT}" -eq 0 && -f "data/isa_daemon.lock" ]]; then
+  OLD_PID="$(cat data/isa_daemon.lock 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -n "${OLD_PID}" && "${OLD_PID}" != "$$" ]] && kill -0 "${OLD_PID}" 2>/dev/null; then
+    echo "[ISA] Stopping previous ISA daemon (PID=${OLD_PID}) before starting fresh instance..."
+    kill "${OLD_PID}" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+
+exec .venv/bin/python -m src.main "${FILTERED_ARGS[@]}"
