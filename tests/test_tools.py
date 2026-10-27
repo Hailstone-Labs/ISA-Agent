@@ -534,3 +534,66 @@ def test_scheduled_morning_briefing_trigger(tmp_path) -> None:
     assert monitor.should_trigger_morning_briefing("08:00", now=morning_dt) is True
     # Subsequent check on the same day -> False
     assert monitor.should_trigger_morning_briefing("08:00", now=morning_dt) is False
+
+
+def test_deterministic_date_and_time_resolution() -> None:
+    from src.tools.calendar import (
+        _parse_calendar_frontmatter,
+        add_one_hour,
+        resolve_date_string,
+        resolve_time_string,
+    )
+
+    # Anchor on Friday, October 23, 2026
+    friday_anchor = datetime(2026, 10, 23, 15, 30)
+
+    assert resolve_date_string("today", base_dt=friday_anchor) == "2026-10-23"
+    assert resolve_date_string("tomorrow", base_dt=friday_anchor) == "2026-10-24"
+    assert resolve_date_string("day after tomorrow", base_dt=friday_anchor) == "2026-10-25"
+    assert resolve_date_string("yesterday", base_dt=friday_anchor) == "2026-10-22"
+    assert resolve_date_string("in 3 days", base_dt=friday_anchor) == "2026-10-26"
+    assert resolve_date_string("in 2 weeks", base_dt=friday_anchor) == "2026-11-06"
+
+    # Weekday math from Friday Oct 23, 2026: Monday MUST be 2026-10-26 (not 2026-10-27!)
+    assert resolve_date_string("Monday", base_dt=friday_anchor) == "2026-10-26"
+    assert resolve_date_string("on Monday", base_dt=friday_anchor) == "2026-10-26"
+    assert resolve_date_string("next Tuesday", base_dt=friday_anchor) == "2026-10-27"
+    assert resolve_date_string("next Friday", base_dt=friday_anchor) == "2026-10-30"
+
+    # Holiday & natural date landmarks
+    assert resolve_date_string("Halloween", base_dt=friday_anchor) == "2026-10-31"
+    assert resolve_date_string("the day after Halloween", base_dt=friday_anchor) == "2026-11-01"
+    assert resolve_date_string("Oct 30", base_dt=friday_anchor) == "2026-10-30"
+
+    # Strict validation still rejects impossible calendar dates
+    with pytest.raises(ValueError, match="Invalid calendar date"):
+        resolve_date_string("2026-02-30", base_dt=friday_anchor)
+
+    # 12h & 24h time normalization
+    assert resolve_time_string("9am") == "09:00"
+    assert resolve_time_string("9:30 AM") == "09:30"
+    assert resolve_time_string("2:15 pm") == "14:15"
+    assert resolve_time_string("12:00 PM") == "12:00"
+    assert resolve_time_string("12:00 AM") == "00:00"
+    assert resolve_time_string("noon") == "12:00"
+    assert resolve_time_string("14:30") == "14:30"
+    assert add_one_hour("09:00") == "10:00"
+    assert add_one_hour("14:30") == "15:30"
+
+    # YAML 1.1 sexagesimal integer normalization in _parse_calendar_frontmatter
+    sample_md = (
+        "---\n"
+        "title: Strategy Sync\n"
+        "allDay: false\n"
+        "startTime: 13:00\n"
+        "endTime: 14:30\n"
+        "date: 2026-10-28\n"
+        "endDate: 2026-10-28\n"
+        "type: single\n"
+        "---\n"
+    )
+    meta = _parse_calendar_frontmatter(sample_md)
+    assert meta["startTime"] == "13:00"
+    assert meta["endTime"] == "14:30"
+    assert meta["date"] == "2026-10-28"
+

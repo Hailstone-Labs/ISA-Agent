@@ -6,7 +6,7 @@ from datetime import datetime
 import re
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
-from src.tools.calendar import validate_iso_date
+from src.tools.calendar import resolve_date_string, validate_iso_date
 from src.tools.notifications import send_macos_notification
 from src.tools.obsidian import ObsidianRestClient
 
@@ -250,9 +250,9 @@ async def update_vault_task(
 ) -> str | None:
     """Update an existing open `- [ ]` task's description, due date, scheduled date, or priority in Tasks.md."""
     if new_due_date is not None and new_due_date.strip():
-        new_due_date = validate_iso_date(new_due_date)
+        new_due_date = resolve_date_string(new_due_date)
     if new_scheduled_date is not None and new_scheduled_date.strip():
-        new_scheduled_date = validate_iso_date(new_scheduled_date)
+        new_scheduled_date = resolve_date_string(new_scheduled_date)
 
     try:
         content = await obsidian.get_note(tasks_filename)

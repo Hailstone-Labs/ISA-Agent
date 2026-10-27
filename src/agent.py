@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import re
@@ -32,10 +32,13 @@ from src.monitor.observer import (
 from src.theme import ensure_obsidian_themes_snippet, get_theme
 from src.tools.calendar import (
     CalendarEventSpec,
+    add_one_hour,
     cancel_vault_calendar_event,
     create_vault_calendar_event,
     list_vault_calendar_events,
     reschedule_vault_calendar_event,
+    resolve_date_string,
+    resolve_time_string,
 )
 from src.tools.calendar_import import (
     CalendarImportResult,
@@ -209,8 +212,22 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
 
     @agent.system_prompt
     def inject_temporal_context() -> str:
-        now_str = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
-        return f"Current System Time: {now_str}"
+        now = datetime.now()
+        today = now.date()
+        now_str = now.strftime("%A, %B %d, %Y, %I:%M %p")
+        yesterday_str = (today - timedelta(days=1)).strftime("%A, %Y-%m-%d")
+        today_iso = today.strftime("%A, %Y-%m-%d")
+        tomorrow_str = (today + timedelta(days=1)).strftime("%A, %Y-%m-%d")
+        lookahead_items = [
+            f"{(today + timedelta(days=offset)).strftime('%a %b %d')}={((today + timedelta(days=offset)).strftime('%Y-%m-%d'))}"
+            for offset in range(0, 14)
+        ]
+        return (
+            f"Current System Time: {now_str}\n"
+            f"- Yesterday: {yesterday_str} | Today: {today_iso} | Tomorrow: {tomorrow_str}\n"
+            f"- 14-Day Reference Calendar (NEVER guess weekday math; use these exact dates): "
+            + ", ".join(lookahead_items)
+        )
 
     @agent.system_prompt
     def inject_rolling_context(ctx: RunContext[ISADependencies]) -> str:
@@ -363,24 +380,44 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
 
         Args:
             title: Title of the event (e.g. 'Performance Review with Alice').
-            date: Start date in YYYY-MM-DD format (e.g. '2026-10-22').
-            start_time: 24-hour start time in HH:MM format (e.g. '10:00'). Required if all_day is False.
-            end_time: 24-hour end time in HH:MM format (e.g. '11:00'). Required if all_day is False.
-            end_date: End date in YYYY-MM-DD format (defaults to date).
-            all_day: Set True only for full-day events without start/end times.
+            date: Start date in YYYY-MM-DD format OR natural language (e.g. '2026-10-28', 'tomorrow', 'next Tuesday', 'Oct 30').
+            start_time: Start time in 24-hour HH:MM or 12-hour format (e.g. '10:00', '14:30', '2:30 PM'). Omit if all_day is True.
+            end_time: End time in 24-hour HH:MM or 12-hour format (e.g. '11:00', '15:30'). Defaults to 1 hour after start_time if omitted.
+            end_date: End date in YYYY-MM-DD format or natural language (defaults to date).
+            all_day: Set True for full-day events without start/end times.
             agenda_or_notes: Optional Markdown agenda or notes for the event body.
         """
         try:
+            resolved_date = resolve_date_string(date)
+            resolved_end_date = (
+                resolve_date_string(end_date)
+                if end_date and end_date.strip()
+                else resolved_date
+            )
+            resolved_start = (
+                resolve_time_string(start_time)
+                if start_time and start_time.strip()
+                else None
+            )
+            resolved_end = (
+                resolve_time_string(end_time)
+                if end_time and end_time.strip()
+                else None
+            )
+            if resolved_start and not resolved_end and not all_day:
+                resolved_end = add_one_hour(resolved_start)
+            effective_all_day = all_day or (resolved_start is None and resolved_end is None)
+
             spec = CalendarEventSpec(
                 title=title,
-                date=date,
-                end_date=end_date,
-                all_day=all_day,
-                start_time=start_time,
-                end_time=end_time,
+                date=resolved_date,
+                end_date=resolved_end_date,
+                all_day=effective_all_day,
+                start_time=None if effective_all_day else resolved_start,
+                end_time=None if effective_all_day else resolved_end,
                 agenda_or_notes=agenda_or_notes,
             )
-        except ValidationError as exc:
+        except (ValidationError, ValueError) as exc:
             raise ModelRetry(f"Calendar event validation failed: {exc}") from exc
 
         await _update_thinking_status(
@@ -390,6 +427,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             obsidian=ctx.deps.obsidian,
             event=spec,
             folder=ctx.deps.settings.calendar_folder,
+            vault_path=ctx.deps.settings.obsidian_vault_path,
         )
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Created event `{spec.title}` on {spec.date} at `{created_path}`")
@@ -448,16 +486,31 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             tags: Optional list of hashtags (e.g. ['#finance', '#work']).
         """
         try:
+            resolved_due = (
+                resolve_date_string(due_date)
+                if due_date and due_date.strip()
+                else None
+            )
+            resolved_scheduled = (
+                resolve_date_string(scheduled_date)
+                if scheduled_date and scheduled_date.strip()
+                else None
+            )
+            resolved_start = (
+                resolve_date_string(start_date)
+                if start_date and start_date.strip()
+                else None
+            )
             spec = TaskSpec(
                 description=description,
-                due_date=due_date,
-                scheduled_date=scheduled_date,
-                start_date=start_date,
+                due_date=resolved_due,
+                scheduled_date=resolved_scheduled,
+                start_date=resolved_start,
                 recurrence=recurrence,
                 priority=priority,
                 tags=tags or [],
             )
-        except ValidationError as exc:
+        except (ValidationError, ValueError) as exc:
             raise ModelRetry(f"Task validation failed: {exc}") from exc
 
         await _update_thinking_status(
