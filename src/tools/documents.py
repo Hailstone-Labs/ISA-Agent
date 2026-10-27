@@ -129,20 +129,209 @@ class SynthesizedDocumentSpec(BaseModel):
         return validate_markdown_syntax(v)
 
 
+async def _write_and_verify_vault_note(
+    obsidian: ObsidianRestClient,
+    vault_root: Path | None,
+    rel_path: str,
+    content: str,
+) -> int:
+    """Write a note via Obsidian REST API with local disk fallback and read-after-write verification."""
+    clean_rel = rel_path.lstrip("/")
+    api_wrote = False
+    try:
+        await obsidian.create_or_overwrite_note(clean_rel, content)
+        api_wrote = True
+    except Exception:
+        if vault_root is None:
+            raise
+
+    if vault_root is not None:
+        local_file = (vault_root / clean_rel).resolve()
+        if not api_wrote or not local_file.exists():
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.write_text(content, encoding="utf-8")
+        if not local_file.exists() or local_file.stat().st_size == 0:
+            raise OSError(f"Read-after-write verification failed: '{clean_rel}' was not persisted to disk.")
+
+    return len(content.encode("utf-8"))
+
+
+def resolve_existing_vault_note(
+    vault_root: Path,
+    note_path_or_query: str,
+    forbidden_files: set[str] | None = None,
+) -> str | None:
+    """Resolve a user or LLM note name/path (e.g. 'SET Meeting' or 'Reports/Blog Overview.md') to an existing vault-relative path."""
+    cleaned = note_path_or_query.strip().lstrip("/")
+    if not cleaned:
+        return None
+    forbidden = {f.lower() for f in (forbidden_files or {"ISA_Inbox.md"})}
+
+    direct_rel = cleaned if cleaned.lower().endswith(".md") else f"{cleaned}.md"
+    direct_path = (vault_root / direct_rel).resolve()
+    if direct_path.exists() and direct_path.is_file():
+        if direct_path.name.lower() not in forbidden:
+            return direct_path.relative_to(vault_root.resolve()).as_posix()
+
+    query_stem = PurePosixPath(direct_rel).stem.lower()
+    exact_stem_matches: list[Path] = []
+    fuzzy_matches: list[Path] = []
+
+    for p in sorted(vault_root.rglob("*.md")):
+        try:
+            rel_parts = p.relative_to(vault_root).parts
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        if p.name.lower() in forbidden:
+            continue
+        if len(rel_parts) > 1 and rel_parts[0].lower() == "archive":
+            continue
+        stem_low = p.stem.lower()
+        if stem_low == query_stem:
+            exact_stem_matches.append(p)
+        elif query_stem in stem_low or stem_low in query_stem:
+            fuzzy_matches.append(p)
+
+    chosen = exact_stem_matches[0] if exact_stem_matches else (fuzzy_matches[0] if fuzzy_matches else None)
+    if chosen is not None:
+        return chosen.resolve().relative_to(vault_root.resolve()).as_posix()
+    return None
+
+
 async def create_synthesized_document(
     obsidian: ObsidianRestClient,
     spec: SynthesizedDocumentSpec,
     notify: bool = True,
+    vault_root: Path | None = None,
 ) -> str:
-    """Validate and write a synthesized document into the Obsidian vault."""
-    await obsidian.create_or_overwrite_note(spec.target_path, spec.content)
+    """Validate, write, and verify a synthesized document in the Obsidian vault."""
+    await _write_and_verify_vault_note(
+        obsidian=obsidian,
+        vault_root=vault_root,
+        rel_path=spec.target_path,
+        content=spec.content,
+    )
     if notify:
         send_macos_notification(
             title="ISA Document Created",
             subtitle=spec.target_path,
-            message="Synthesized note saved to Obsidian vault.",
+            message="Synthesized note saved and verified in Obsidian vault.",
         )
     return spec.target_path
+
+
+async def edit_vault_document(
+    obsidian: ObsidianRestClient,
+    vault_root: Path,
+    target_path: str,
+    append_text: str | None = None,
+    target_text: str | None = None,
+    replacement_text: str | None = None,
+    new_content: str | None = None,
+    section_heading: str | None = None,
+    notify: bool = True,
+) -> tuple[str, int]:
+    """Edit or append to an existing Markdown note in the vault with read-after-write verification.
+
+    Returns `(resolved_vault_path, verified_byte_size)`.
+    """
+    resolved_rel = resolve_existing_vault_note(vault_root, target_path)
+    if resolved_rel is None:
+        # If note doesn't exist yet and caller provided new_content or append_text, validate path and create it
+        resolved_rel = validate_vault_path(target_path)
+
+    existing_content = ""
+    try:
+        existing_content = await obsidian.get_note(resolved_rel)
+    except Exception:
+        local_p = vault_root / resolved_rel
+        if local_p.exists():
+            existing_content = local_p.read_text(encoding="utf-8")
+
+    if not existing_content:
+        # Creating a brand-new note from the provided content
+        initial_body = new_content or append_text or replacement_text or ""
+        validated = validate_markdown_syntax(initial_body)
+        byte_len = await _write_and_verify_vault_note(
+            obsidian=obsidian,
+            vault_root=vault_root,
+            rel_path=resolved_rel,
+            content=validated,
+        )
+        if notify:
+            send_macos_notification(
+                title="ISA Document Created",
+                subtitle=resolved_rel,
+                message=f"Verified on disk ({byte_len} bytes).",
+            )
+        return resolved_rel, byte_len
+
+    updated_content = existing_content
+
+    if target_text and target_text.strip() and replacement_text is not None:
+        if target_text in existing_content:
+            updated_content = existing_content.replace(target_text, replacement_text)
+        else:
+            # Case-insensitive fallback search
+            pattern = re.compile(re.escape(target_text.strip()), flags=re.IGNORECASE)
+            if pattern.search(existing_content):
+                updated_content = pattern.sub(replacement_text, existing_content, count=1)
+            else:
+                raise ValueError(
+                    f"Target text '{target_text[:60]}' was not found in `{resolved_rel}`. "
+                    f"Read the note first or use `append_text` / `new_content`."
+                )
+    elif append_text and append_text.strip():
+        clean_addition = append_text.strip()
+        if section_heading and section_heading.strip():
+            clean_heading = section_heading.strip().lstrip("#").strip()
+            heading_re = re.compile(
+                rf"(^#+\s*{re.escape(clean_heading)}\s*$\n?)",
+                flags=re.IGNORECASE | re.MULTILINE,
+            )
+            if heading_re.search(existing_content):
+                updated_content = heading_re.sub(
+                    rf"\1\n{clean_addition}\n",
+                    existing_content,
+                    count=1,
+                )
+            else:
+                heading_prefix = section_heading.strip() if section_heading.strip().startswith("#") else f"## {clean_heading}"
+                updated_content = existing_content.rstrip() + f"\n\n{heading_prefix}\n\n{clean_addition}\n"
+        else:
+            updated_content = existing_content.rstrip() + f"\n\n{clean_addition}\n"
+    elif new_content and new_content.strip():
+        cleaned_new = validate_markdown_syntax(new_content)
+        # Preserve existing YAML frontmatter if existing note had frontmatter and new_content omitted it
+        if existing_content.startswith("---") and not cleaned_new.startswith("---"):
+            parts = existing_content.split("---", 2)
+            if len(parts) >= 3:
+                updated_content = f"---{parts[1]}---\n{cleaned_new}"
+            else:
+                updated_content = cleaned_new
+        else:
+            updated_content = cleaned_new
+    else:
+        raise ValueError(
+            "Must provide `append_text`, `target_text` + `replacement_text`, or `new_content` to edit a document."
+        )
+
+    validated_final = validate_markdown_syntax(updated_content)
+    byte_len = await _write_and_verify_vault_note(
+        obsidian=obsidian,
+        vault_root=vault_root,
+        rel_path=resolved_rel,
+        content=validated_final,
+    )
+    if notify:
+        send_macos_notification(
+            title="ISA Document Updated",
+            subtitle=resolved_rel,
+            message=f"Verified update on disk ({byte_len} bytes).",
+        )
+    return resolved_rel, byte_len
 
 
 async def instantiate_template_note(
@@ -177,7 +366,12 @@ async def instantiate_template_note(
         rendered = rendered.rstrip() + "\n\n" + extra_body.strip() + "\n"
 
     validated_payload = validate_markdown_syntax(rendered)
-    await obsidian.create_or_overwrite_note(safe_target, validated_payload)
+    await _write_and_verify_vault_note(
+        obsidian=obsidian,
+        vault_root=vault_root,
+        rel_path=safe_target,
+        content=validated_payload,
+    )
 
     try:
         await obsidian.execute_command("templater-obsidian:replace-in-file-templater")

@@ -597,3 +597,96 @@ def test_deterministic_date_and_time_resolution() -> None:
     assert meta["endTime"] == "14:30"
     assert meta["date"] == "2026-10-28"
 
+
+@pytest.mark.anyio
+async def test_edit_vault_document_and_note_resolution(tmp_path) -> None:
+    from src.tools.documents import edit_vault_document, resolve_existing_vault_note
+
+    reports_dir = tmp_path / "Reports"
+    reports_dir.mkdir(parents=True)
+    blog_note = reports_dir / "Blog Overview.md"
+    blog_note.write_text(
+        "---\n"
+        "title: Blog Overview\n"
+        "status: draft\n"
+        "---\n\n"
+        "# Blog Overview\n\n"
+        "## Topics\n"
+        "- Local AI agents\n\n"
+        "## Notes\n"
+        "Initial outline.\n",
+        encoding="utf-8",
+    )
+
+    # 1. Partial title resolution finds 'Reports/Blog Overview.md'
+    resolved = resolve_existing_vault_note(tmp_path, "Blog Overview")
+    assert resolved == "Reports/Blog Overview.md"
+
+    obs = FakeObsidian(tmp_path)
+
+    # 2. Section append
+    saved_path, size_bytes = await edit_vault_document(
+        obsidian=obs,
+        vault_root=tmp_path,
+        target_path="Blog Overview",
+        append_text="- Air-gapped Obsidian RAG",
+        section_heading="## Topics",
+        notify=False,
+    )
+    assert saved_path == "Reports/Blog Overview.md"
+    assert size_bytes > 0
+    content_after_append = blog_note.read_text(encoding="utf-8")
+    assert "- Local AI agents" in content_after_append
+    assert "- Air-gapped Obsidian RAG" in content_after_append
+    assert "## Notes" in content_after_append
+
+    # 3. Targeted find-and-replace
+    await edit_vault_document(
+        obsidian=obs,
+        vault_root=tmp_path,
+        target_path="Blog Overview",
+        target_text="Initial outline.",
+        replacement_text="Updated executive outline with benchmarks.",
+        notify=False,
+    )
+    content_after_replace = blog_note.read_text(encoding="utf-8")
+    assert "Updated executive outline with benchmarks." in content_after_replace
+    assert "Initial outline." not in content_after_replace
+
+    # 4. Full body update preserves existing YAML frontmatter if omitted
+    await edit_vault_document(
+        obsidian=obs,
+        vault_root=tmp_path,
+        target_path="Blog Overview",
+        new_content="# Blog Overview\n\nCompletely rewritten body.",
+        notify=False,
+    )
+    content_after_rewrite = blog_note.read_text(encoding="utf-8")
+    assert content_after_rewrite.startswith("---\ntitle: Blog Overview\nstatus: draft\n---")
+    assert "Completely rewritten body." in content_after_rewrite
+
+
+def test_unbacked_write_claim_detection_regex() -> None:
+    from src.agent import UNBACKED_WRITE_CLAIM_RE, USER_DOC_MUTATION_INTENT_RE
+
+    # Phantom write claims in prose must match UNBACKED_WRITE_CLAIM_RE
+    assert UNBACKED_WRITE_CLAIM_RE.search(
+        "I have created the document `Reports/Q4 Summary.md` for you."
+    )
+    assert UNBACKED_WRITE_CLAIM_RE.search(
+        "I've updated the note `SET Meeting.md` with the new agenda items."
+    )
+    assert UNBACKED_WRITE_CLAIM_RE.search(
+        "Successfully edited the file `Blog Overview.md`."
+    )
+    # Normal read/informational responses must NOT match
+    assert not UNBACKED_WRITE_CLAIM_RE.search(
+        "Here is a summary of the `SET Meeting.md` note from last week:"
+    )
+
+    # User document creation/editing intent detection
+    assert USER_DOC_MUTATION_INTENT_RE.search("Create a new document summarizing the SET meeting")
+    assert USER_DOC_MUTATION_INTENT_RE.search("Edit the Blog Overview note to add a section on security")
+    assert not USER_DOC_MUTATION_INTENT_RE.search("What is in the Blog Overview note?")
+
+

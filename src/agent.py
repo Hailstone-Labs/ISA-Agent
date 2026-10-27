@@ -50,8 +50,10 @@ from src.tools.documents import (
     archive_inbox_transcript,
     clear_inbox_page,
     create_synthesized_document,
+    edit_vault_document,
     generate_daily_executive_briefing,
     instantiate_template_note,
+    resolve_existing_vault_note,
     sync_meeting_action_items,
 )
 from src.tools.notifications import send_macos_notification
@@ -72,6 +74,22 @@ THINKING_BLOCK_REGEX = re.compile(
     re.DOTALL,
 )
 
+UNBACKED_WRITE_CLAIM_RE = re.compile(
+    r"(?:"
+    r"\b(?:I\s+have|I've|I\s+just|successfully)\s+(?:created|written|saved|updated|edited|modified|appended|instantiated|overwritten)\s+"
+    r"(?:the\s+|your\s+|a\s+|an\s+)?(?:note|document|file|report|brief|summary|section|template|changes|edits|`[^`]+\.md`)"
+    r"|\b(?:note|document|file|report|changes|edits)\s+(?:has|have)\s+been\s+(?:created|saved|updated|edited|written|modified|applied)\b"
+    r"|\b(?:saved|written|created|updated|edited)\s+(?:at|in|to)\s+`[^`]+\.md`"
+    r"|\b(?:STATUS:\s*FILE_(?:CREATED|UPDATED|SAVED)|DOCUMENT_(?:CREATED|UPDATED|SAVED))\b"
+    r")",
+    re.IGNORECASE,
+)
+
+USER_DOC_MUTATION_INTENT_RE = re.compile(
+    r"\b(?:edit|update|modify|append|add\s+a\s+section|add\s+to|write\s+a\s+(?:new\s+)?(?:note|document|report|brief)|create\s+a\s+(?:new\s+)?(?:note|document|report|brief|file))\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class ISADependencies:
@@ -87,6 +105,7 @@ class ISADependencies:
     active_inline_note: str | None = None
     inbox_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     turn_tool_context: list[str] = field(default_factory=list)
+    turn_write_actions: list[str] = field(default_factory=list)
 
 
 def _sync_vault_index_immediately(deps: ISADependencies) -> int:
@@ -201,14 +220,51 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             "call `extract_meeting_action_items`.\n"
             "12. When asked to create a standardized note from a template (e.g. 'Daily Standup Template', "
             "'Meeting Minutes Template', 'Project Brief Template'), call `create_note_from_template`.\n"
-            "13. When asked to draft, synthesize, or save a new standalone report/note into the vault, "
-            "call `create_document`.\n"
-            "14. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
-            "15. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
+            "13. When asked to draft, synthesize, or save a brand-new standalone report/note into the vault, "
+            "ALWAYS call `create_document`.\n"
+            "14. When asked to edit, update, modify, append to, or add a section to an existing note/document in the vault, "
+            "ALWAYS call `edit_document`.\n"
+            "15. When asked to manually rescan, refresh, or re-index the vault database, call `rescan_vault_database`.\n"
+            "16. Call `search_vault` or `read_vault_note` ONLY when the user asks about existing "
             "notes, files, projects, or past records in their vault.\n"
-            "16. Never call `search_vault` more than once or twice per request."
+            "17. Never call `search_vault` more than once or twice per request.\n"
+            "18. CRITICAL INTEGRITY RULE: NEVER claim you created, edited, updated, or saved a document, note, task, or event "
+            "unless you have actually executed the corresponding write tool (`create_document`, `edit_document`, `create_note_from_template`, "
+            "`create_task`, `update_task`, or `create_calendar_event`) in the current turn."
         ),
     )
+
+    @agent.output_validator
+    def verify_write_actions_not_hallucinated(
+        ctx: RunContext[ISADependencies], output: str
+    ) -> str:
+        """Prevent phantom writes: if no write tool ran in this turn, reject claims of creating/editing files."""
+        if ctx.deps.turn_write_actions:
+            return output
+
+        active_cmd = (ctx.deps.active_command or "").strip()
+        # Check 1: Output explicitly claims a file/note/document was created, edited, updated, or saved
+        if UNBACKED_WRITE_CLAIM_RE.search(output):
+            raise ModelRetry(
+                "VERIFICATION FAILURE: Your response claims that a document, note, or file was created, edited, "
+                "updated, or saved, but NO write tool was executed during this turn (`turn_write_actions` is empty). "
+                "You MUST call `create_document`, `edit_document`, or `create_note_from_template` now to actually persist "
+                "the changes to disk before telling the user it is done."
+            )
+
+        # Check 2: User explicitly requested editing/updating/creating a document and model didn't call any write tool or ask a question
+        if (
+            active_cmd
+            and USER_DOC_MUTATION_INTENT_RE.search(active_cmd)
+            and "?" not in output
+        ):
+            raise ModelRetry(
+                "VERIFICATION FAILURE: The user asked you to create, edit, update, or modify a document/note, "
+                "but you did not call `create_document`, `edit_document`, or `create_note_from_template`. "
+                "Call the appropriate document tool now so the changes are actually written to the vault."
+            )
+
+        return output
 
     @agent.system_prompt
     def inject_temporal_context() -> str:
@@ -290,17 +346,25 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
     @agent.tool
     async def read_vault_note(ctx: RunContext[ISADependencies], note_path: str) -> str:
         """Read the raw Markdown content of a specific note in the Obsidian vault."""
+        resolved_path = (
+            resolve_existing_vault_note(ctx.deps.settings.obsidian_vault_path, note_path)
+            or note_path
+        )
         await _update_thinking_status(
-            ctx.deps, f"📄 Reading note `{note_path}`..."
+            ctx.deps, f"📄 Reading note `{resolved_path}`..."
         )
         try:
-            content = await ctx.deps.obsidian.get_note(note_path)
-            ctx.deps.turn_tool_context.append(
-                f"Read `{note_path}` ({len(content)} chars): {content[:140]}"
-            )
-            return content
+            content = await ctx.deps.obsidian.get_note(resolved_path)
         except Exception as exc:
-            return f"Error reading note '{note_path}': {exc}"
+            local_p = ctx.deps.settings.obsidian_vault_path / resolved_path.lstrip("/")
+            if local_p.exists():
+                content = local_p.read_text(encoding="utf-8")
+            else:
+                return f"Error reading note '{note_path}': {exc}"
+        ctx.deps.turn_tool_context.append(
+            f"Read `{resolved_path}` ({len(content)} chars): {content[:140]}"
+        )
+        return content
 
     @agent.tool
     async def list_calendar_events(
@@ -360,6 +424,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
 
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Canceled calendar event: {', '.join(deleted)}")
+        ctx.deps.turn_write_actions.append(f"Canceled calendar event: {', '.join(deleted)}")
         return (
             f"Successfully canceled and removed {len(deleted)} event(s) from the calendar:\n"
             + "\n".join(f"- `{p}`" for p in deleted)
@@ -431,6 +496,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         )
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Created event `{spec.title}` on {spec.date} at `{created_path}`")
+        ctx.deps.turn_write_actions.append(f"Created event `{spec.title}` at `{created_path}`")
         return (
             f"Created Obsidian Full Calendar event at `{created_path}`:\n"
             f"```yaml\n{spec.to_markdown().strip()}\n```"
@@ -524,12 +590,14 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         )
         if not created_new:
             ctx.deps.turn_tool_context.append(f"Task already exists on list: {task_line}")
+            ctx.deps.turn_write_actions.append(f"Verified existing task: {task_line}")
             return (
                 f"Task is already recorded on your active task list in `{ctx.deps.settings.active_tasks_filename}`:\n"
                 f"`{task_line}`"
             )
 
         ctx.deps.turn_tool_context.append(f"Created task: {task_line}")
+        ctx.deps.turn_write_actions.append(f"Created task: {task_line}")
         return (
             f"Appended task to `{ctx.deps.settings.active_tasks_filename}`:\n"
             f"`{task_line}`"
@@ -573,10 +641,67 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         saved_path = await create_synthesized_document(
             obsidian=ctx.deps.obsidian,
             spec=spec,
+            vault_root=ctx.deps.settings.obsidian_vault_path,
         )
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Created document `{saved_path}`")
-        return f"Successfully created vault document at `{saved_path}`."
+        ctx.deps.turn_write_actions.append(f"Created document `{saved_path}`")
+        return f"Successfully created and verified vault document at `{saved_path}`."
+
+    @agent.tool
+    async def edit_document(
+        ctx: RunContext[ISADependencies],
+        target_path: str,
+        append_text: str | None = None,
+        target_text: str | None = None,
+        replacement_text: str | None = None,
+        new_content: str | None = None,
+        section_heading: str | None = None,
+    ) -> str:
+        """Edit, update, or append to an existing Markdown note in the vault.
+
+        Automatically resolves partial note titles (e.g. 'SET Meeting' -> 'Meetings/SET Meeting.md')
+        and verifies the updated file on disk. Provide ONE of:
+        1) `append_text` (and optional `section_heading` like '## Notes') to append content without overwriting the note,
+        2) `target_text` + `replacement_text` to replace a specific passage in-place, OR
+        3) `new_content` to replace the body while preserving existing YAML frontmatter.
+
+        Args:
+            target_path: Vault-relative path or note title (e.g. 'Meetings/SET Meeting.md' or 'Blog Overview').
+            append_text: Markdown content to append to the end of the note or under `section_heading`.
+            target_text: Exact existing text snippet in the note to replace.
+            replacement_text: New text to substitute in place of `target_text`.
+            new_content: Full replacement Markdown body (existing YAML frontmatter is preserved if omitted).
+            section_heading: Optional Markdown heading (e.g. '## Action Items') under which to insert `append_text`.
+        """
+        await _update_thinking_status(
+            ctx.deps, f"✏️ Editing vault note `{target_path}`..."
+        )
+        try:
+            saved_path, size_bytes = await edit_vault_document(
+                obsidian=ctx.deps.obsidian,
+                vault_root=ctx.deps.settings.obsidian_vault_path,
+                target_path=target_path,
+                target_text=target_text,
+                replacement_text=replacement_text,
+                append_text=append_text,
+                section_heading=section_heading,
+                new_content=new_content,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise ModelRetry(f"Document edit failed: {exc}") from exc
+
+        _sync_vault_index_immediately(ctx.deps)
+        ctx.deps.turn_tool_context.append(
+            f"Edited document `{saved_path}` ({size_bytes} bytes verified on disk)"
+        )
+        ctx.deps.turn_write_actions.append(
+            f"Edited document `{saved_path}` ({size_bytes} bytes verified on disk)"
+        )
+        return (
+            f"Successfully updated and verified vault document `{saved_path}` "
+            f"({size_bytes} bytes on disk)."
+        )
 
     @agent.tool
     async def create_note_from_template(
@@ -613,6 +738,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             raise ModelRetry(f"Template instantiation failed: {exc}") from exc
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Instantiated `{saved_path}` from template `{template_name}`")
+        ctx.deps.turn_write_actions.append(f"Instantiated `{saved_path}` from template `{template_name}`")
         return (
             f"Successfully instantiated `{saved_path}` from template `{template_name}`."
         )
@@ -639,6 +765,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             return f"No open task matched '{description_query}' in `{ctx.deps.settings.active_tasks_filename}`."
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Completed task(s): {'; '.join(completed)}")
+        ctx.deps.turn_write_actions.append(f"Completed task(s): {'; '.join(completed)}")
         return (
             f"Marked {len(completed)} task(s) as completed in `{ctx.deps.settings.active_tasks_filename}`:\n"
             + "\n".join(f"`{c}`" for c in completed)
@@ -682,6 +809,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             return f"No open task matched '{description_query}' in `{ctx.deps.settings.active_tasks_filename}`."
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Updated task: {updated_line}")
+        ctx.deps.turn_write_actions.append(f"Updated task: {updated_line}")
         return f"Updated task in `{ctx.deps.settings.active_tasks_filename}`:\n`{updated_line}`"
 
     @agent.tool
@@ -728,6 +856,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(
             f"Rescheduled `{spec.title}` to {spec.date} ({spec.start_time}-{spec.end_time}) at `{new_path}`"
+        )
+        ctx.deps.turn_write_actions.append(
+            f"Rescheduled `{spec.title}` to `{new_path}`"
         )
         return (
             f"Rescheduled calendar event to `{new_path}`:\n"
@@ -814,6 +945,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         ctx.deps.turn_tool_context.append(
             f"Imported calendar: {total_created} created, {total_updated} updated, {total_skipped} skipped"
         )
+        ctx.deps.turn_write_actions.append(
+            f"Imported calendar: {total_created} created, {total_updated} updated"
+        )
         summary = CalendarImportResult(
             created=total_created,
             updated=total_updated,
@@ -848,6 +982,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         )
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(f"Generated briefing at `{saved_path}`")
+        ctx.deps.turn_write_actions.append(f"Generated briefing at `{saved_path}`")
         return f"Created Daily Executive Briefing at `{saved_path}`:\n\n{briefing_md}"
 
     @agent.tool
@@ -868,6 +1003,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             return "Inbox is already compact; no older exchanges needed archiving."
         _sync_vault_index_immediately(ctx.deps)
         ctx.deps.turn_tool_context.append(
+            f"Archived {count} exchange(s) to `{archive_path}`"
+        )
+        ctx.deps.turn_write_actions.append(
             f"Archived {count} exchange(s) to `{archive_path}`"
         )
         return f"Archived {count} older exchange(s) to `{archive_path}`."
@@ -907,6 +1045,9 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
 
         ctx.deps.turn_tool_context.append(
             f"Synced {len(added_lines)} action item(s) from `{note_rel_path}` to `{ctx.deps.settings.active_tasks_filename}`"
+        )
+        ctx.deps.turn_write_actions.append(
+            f"Synced {len(added_lines)} action item(s) from `{note_rel_path}`"
         )
         summary_lines = [
             f"Processed meeting note `{note_rel_path}`:",
@@ -959,6 +1100,7 @@ async def dispatch_inbox_command(
     deps.handler = handler
     deps.active_command = command
     deps.turn_tool_context.clear()
+    deps.turn_write_actions.clear()
     if handler is not None:
         handler.mark_command_dispatched(command)
     if deps.context_window is None:
@@ -1323,6 +1465,7 @@ async def dispatch_inline_note_command(
     deps.active_command = command
     deps.active_inline_note = rel_path
     deps.turn_tool_context.clear()
+    deps.turn_write_actions.clear()
 
     try:
         note_content = resolved_path.read_text(encoding="utf-8")
