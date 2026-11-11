@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 from pathlib import Path
 import re
@@ -79,11 +80,12 @@ class LocalVectorStore:
         return list(res.tables) if hasattr(res, "tables") else list(res)
 
     def upsert_chunks(self, records: list[VaultChunkRecord]) -> int:
-        """Create or overwrite the vault_chunks table with the given embedded records."""
+        """Create or overwrite the vault_chunks table with the given embedded records and build FTS index."""
         if not records:
             return 0
         payload = [rec.model_dump() for rec in records]
-        self.db.create_table(self.TABLE_NAME, data=payload, mode="overwrite")
+        tbl = self.db.create_table(self.TABLE_NAME, data=payload, mode="overwrite")
+        tbl.create_fts_index("text", replace=True)
         return len(payload)
 
     def delete_file_chunks(self, rel_file_path: str) -> None:
@@ -108,6 +110,7 @@ class LocalVectorStore:
         table = self.db.open_table(self.TABLE_NAME)
         payload = [rec.model_dump() for rec in records]
         table.add(payload)
+        table.create_fts_index("text", replace=True)
         return len(payload)
 
     def get_all_chunks(self) -> list[dict]:
@@ -170,39 +173,44 @@ class LocalVectorStore:
         rrf_k: int | None = None,
         expand_wikilinks: bool = True,
     ) -> list[dict]:
-        """Execute Hybrid Search (Dense Vector + BM25) fused with RRF and optional 1-hop [[WikiLink]] graph traversal."""
+        """Execute LanceDB native Hybrid Search (`query_type="hybrid"`) using default RRF and optional 1-hop [[WikiLink]] graph traversal."""
         if self.TABLE_NAME not in self.list_tables():
             return []
 
-        k_val = rrf_k if rrf_k is not None else self.settings.rrf_k
-        candidate_pool = max(limit * 3, 10)
-
+        tbl = self.db.open_table(self.TABLE_NAME)
         query_vec = embedder.embed_query(query)
-        dense_hits = self.search_dense(query_vec, limit=candidate_pool)
-        bm25_hits = self.search_bm25(query, limit=candidate_pool)
+        try:
+            native_hits = (
+                tbl.search(query_type="hybrid")
+                .vector(query_vec)
+                .text(query)
+                .limit(limit)
+                .to_list()
+            )
+        except Exception:
+            tbl.create_fts_index("text", replace=True)
+            native_hits = (
+                tbl.search(query_type="hybrid")
+                .vector(query_vec)
+                .text(query)
+                .limit(limit)
+                .to_list()
+            )
 
-        chunk_lookup: dict[str, dict] = {}
-        dense_ids: list[str] = []
-        for hit in dense_hits:
-            cid = hit["chunk_id"]
-            chunk_lookup[cid] = hit
-            dense_ids.append(cid)
-
-        bm25_ids: list[str] = []
-        for hit in bm25_hits:
-            cid = hit["chunk_id"]
-            if cid not in chunk_lookup:
-                chunk_lookup[cid] = hit
-            bm25_ids.append(cid)
-
-        fused = reciprocal_rank_fusion([dense_ids, bm25_ids], k=k_val)
+        query_tokens = set(tokenize_for_bm25(query))
         results: list[dict] = []
         seen_chunk_ids: set[str] = set()
-        for cid, rrf_score in fused[:limit]:
-            doc = dict(chunk_lookup[cid])
-            doc["rrf_score"] = rrf_score
-            doc["matched_dense"] = cid in dense_ids
-            doc["matched_bm25"] = cid in bm25_ids
+        for hit in native_hits:
+            cid = hit["chunk_id"]
+            doc = dict(hit)
+            doc_tokens = set(
+                tokenize_for_bm25(
+                    f"{doc.get('file_path', '')} {doc.get('heading_hierarchy', '')} {doc.get('text', '')}"
+                )
+            )
+            doc["rrf_score"] = float(hit.get("_relevance_score", 0.0))
+            doc["matched_dense"] = True
+            doc["matched_bm25"] = bool(query_tokens.intersection(doc_tokens))
             doc["matched_graph"] = False
             results.append(doc)
             seen_chunk_ids.add(cid)
@@ -288,6 +296,8 @@ def ingest_vault_to_lancedb(
         for chunk, vec in zip(all_chunks, vectors, strict=True)
     ]
     count = store.upsert_chunks(records)
+    tbl = store.db.open_table(store.TABLE_NAME)
+    tbl.create_fts_index("text", replace=True)
     logger.info(
         "Ingested %d Markdown chunks across %d files into LanceDB (%s).",
         count,
@@ -357,3 +367,91 @@ def sync_single_vault_file_to_lancedb(
         rel_path,
     )
     return upserted
+
+
+_MD_IMAGE_LINK_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_OBSIDIAN_EMBED_RE = re.compile(r"!\[\[[^\]]+\]\]")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_EMPTY_TABLE_ROW_RE = re.compile(r"^\s*\|(?:[\s:-]*\|)+\s*$", re.MULTILINE)
+_EMPTY_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s*(?:\[[ xX]\]\s*)?$", re.MULTILINE)
+_HORIZONTAL_RULE_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$", re.MULTILINE)
+_CONSECUTIVE_BLANKS_RE = re.compile(r"\n(?:[ \t]*\n)+")
+
+
+def _clean_single_chunk(raw_chunk: str) -> str:
+    """Strip Markdown boilerplate and consecutive blank lines from a single retrieved chunk."""
+    text = raw_chunk
+    text = _HTML_COMMENT_RE.sub("", text)
+    text = _MD_IMAGE_LINK_RE.sub("", text)
+    text = _OBSIDIAN_EMBED_RE.sub("", text)
+    text = _EMPTY_TABLE_ROW_RE.sub("", text)
+    text = _EMPTY_BULLET_RE.sub("", text)
+    text = _HORIZONTAL_RULE_RE.sub("", text)
+
+    lines = [re.sub(r"[ \t]{2,}", " ", ln.rstrip()) for ln in text.splitlines()]
+    non_empty_lines = [ln for ln in lines if ln.strip()]
+    cleaned = "\n".join(non_empty_lines)
+    cleaned = _CONSECUTIVE_BLANKS_RE.sub("\n", cleaned)
+    return cleaned.strip()
+
+
+def _chunks_overlap_heavily(chunk_a: str, chunk_b: str, threshold: float = 0.80) -> bool:
+    """Return True if two chunks have high character-sequence or token-containment overlap."""
+    norm_a = chunk_a.lower().strip()
+    norm_b = chunk_b.lower().strip()
+    if not norm_a or not norm_b:
+        return True
+    if norm_a in norm_b or norm_b in norm_a:
+        return True
+
+    tokens_a = set(tokenize_for_bm25(norm_a))
+    tokens_b = set(tokenize_for_bm25(norm_b))
+    if tokens_a and tokens_b:
+        containment = len(tokens_a.intersection(tokens_b)) / min(len(tokens_a), len(tokens_b))
+        if containment >= threshold:
+            return True
+
+    seq_ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    return seq_ratio >= threshold
+
+
+def compress_context(retrieved_docs: list[str]) -> str:
+    """Deterministically filter, deduplicate, and compress retrieved Markdown chunks to <= 3,000 chars.
+
+    1. Strips Markdown boilerplate (image links, Obsidian embeds, HTML comments, empty table rows).
+    2. Removes consecutive blank lines.
+    3. Deduplicates highly overlapping string chunks.
+    4. Strictly truncates the final combined output to at most 3,000 characters.
+    """
+    MAX_CONTEXT_CHARS = 3000
+    if not retrieved_docs:
+        return ""
+
+    deduped_chunks: list[str] = []
+    for raw in retrieved_docs:
+        if not raw or not raw.strip():
+            continue
+        cleaned = _clean_single_chunk(raw)
+        if not cleaned:
+            continue
+
+        is_redundant = False
+        for idx, existing in enumerate(deduped_chunks):
+            if _chunks_overlap_heavily(cleaned, existing):
+                # Keep the longer, more complete chunk if one contains the other
+                if cleaned.lower() in existing.lower():
+                    is_redundant = True
+                    break
+                if existing.lower() in cleaned.lower() and len(cleaned) > len(existing):
+                    deduped_chunks[idx] = cleaned
+                is_redundant = True
+                break
+
+        if not is_redundant:
+            deduped_chunks.append(cleaned)
+
+    combined = "\n\n".join(deduped_chunks)
+    if len(combined) > MAX_CONTEXT_CHARS:
+        combined = combined[:MAX_CONTEXT_CHARS].rstrip()
+    return combined
+
