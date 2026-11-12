@@ -479,3 +479,99 @@ async def test_import_calendar_fast_command(tmp_path) -> None:
     assert "Calendar Import Complete" in reply2
     assert "**Unchanged (Skipped):** 1" in reply2
 
+
+def test_compress_context_strips_boilerplate_deduplicates_and_truncates() -> None:
+    from src.memory.vector_db import compress_context
+
+    docs = [
+        (
+            "### File: `Architecture.md`\n\n\n\n"
+            "![System Diagram](https://example.com/diagram.png)\n"
+            "![[local_chart.svg|400]]\n"
+            "|   |   |\n"
+            "| --- | --- |\n"
+            "| Latency | 12ms |\n\n\n"
+            "Core architecture uses embedded LanceDB with RRF hybrid search."
+        ),
+        # Highly overlapping duplicate chunk
+        "Core architecture uses embedded LanceDB with RRF hybrid search.",
+        # Distinct chunk that pushes total length past 3,000 characters
+        "Unique milestone details: " + ("AlphaBetaGamma " * 250),
+    ]
+
+    compressed = compress_context(docs)
+    assert "![System Diagram]" not in compressed
+    assert "![[local_chart.svg|400]]" not in compressed
+    assert "|   |   |" not in compressed
+    assert "| Latency | 12ms |" in compressed
+    assert "\n\n\n" not in compressed
+    # Overlapping chunk must appear only once
+    assert compressed.count("Core architecture uses embedded LanceDB with RRF hybrid search.") == 1
+    # Strictly truncated to at most 3,000 characters
+    assert len(compressed) <= 3000
+
+
+@pytest.mark.anyio
+async def test_inject_current_datetime_persists_across_multi_turn_rolling_context(tmp_path) -> None:
+    from pydantic_ai import capture_run_messages
+    from pydantic_ai.models.test import TestModel
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    (vault_dir / "ISA_Inbox.md").write_text("# ISA Inbox\n\n@ISA What is today's date?\n", encoding="utf-8")
+
+    class DummyClient:
+        def __init__(self, root):
+            self.root = root
+
+        async def get_note(self, path: str) -> str:
+            p = self.root / path.lstrip("/")
+            return p.read_text(encoding="utf-8") if p.exists() else ""
+
+        async def create_or_overwrite_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        async def append_to_note(self, path: str, content: str) -> None:
+            p = self.root / path.lstrip("/")
+            existing = p.read_text(encoding="utf-8") if p.exists() else ""
+            p.write_text(existing + content, encoding="utf-8")
+
+        async def execute_command(self, cmd: str) -> None:
+            pass
+
+    settings = ISASettings(
+        OBSIDIAN_VAULT_PATH=vault_dir,
+        LANCEDB_URI=tmp_path / "lancedb",
+    )
+    window = RollingContextWindow(max_entries=10, persist_path=tmp_path / "rolling_context.json")
+    window.add_entry(user_prompt="Confirm you are online.", assistant_response="Online.")
+
+    deps = ISADependencies(
+        settings=settings,
+        obsidian=DummyClient(vault_dir),
+        context_window=window,
+    )
+    agent = build_isa_agent(settings)
+
+    with capture_run_messages() as messages:
+        with agent.override(model=TestModel(call_tools=[])):
+            await dispatch_inbox_command(
+                command="What is today's date?",
+                deps=deps,
+                agent=agent,
+            )
+
+    sys_contents = [
+        getattr(part, "content", "")
+        for part in messages[0].parts
+        if type(part).__name__ == "SystemPromptPart"
+    ]
+    combined_sys = "\n".join(sys_contents)
+    assert "The current date and time is " in combined_sys
+    assert "Use this to resolve relative dates like 'tomorrow' or 'next week'." in combined_sys
+    assert "Recent Conversation History" in combined_sys
+
+
+

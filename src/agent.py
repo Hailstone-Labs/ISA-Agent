@@ -19,7 +19,11 @@ from pydantic_ai.settings import ModelSettings
 from config.settings import ISASettings, get_settings
 from src.memory.context_window import RollingContextWindow
 from src.memory.ingest import EmbedderProtocol, LocalEmbedder
-from src.memory.vector_db import LocalVectorStore, ingest_vault_to_lancedb
+from src.memory.vector_db import (
+    LocalVectorStore,
+    compress_context,
+    ingest_vault_to_lancedb,
+)
 from src.monitor.observer import (
     CURSOR_PLACEHOLDER,
     FAST_COMMANDS,
@@ -268,6 +272,12 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
         return output
 
     @agent.system_prompt
+    def inject_current_datetime() -> str:
+        # Format: "Tuesday, November 10, 2026 at 07:24 PM"
+        now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        return f"The current date and time is {now}. Use this to resolve relative dates like 'tomorrow' or 'next week'."
+
+    @agent.system_prompt
     def inject_temporal_context() -> str:
         now = datetime.now()
         today = now.date()
@@ -324,7 +334,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
                 ctx.deps.turn_tool_context.append(
                     f"Found `{hit['file_path']}` ({hit['heading_hierarchy']}){graph_tag}: {hit['text'][:120]}"
                 )
-            return "\n\n---\n\n".join(formatted_chunks)
+            return compress_context(formatted_chunks)
 
         results = await ctx.deps.obsidian.search_simple(query)
         inbox_name = ctx.deps.settings.inbox_filename
@@ -342,7 +352,7 @@ def build_isa_agent(settings: ISASettings | None = None) -> Agent[ISADependencie
             ctx.deps.turn_tool_context.append(
                 f"Matched note `{filename}`: {' ... '.join(snippets)[:120]}"
             )
-        return "\n".join(formatted)
+        return compress_context(formatted)
 
     @agent.tool
     async def read_vault_note(ctx: RunContext[ISADependencies], note_path: str) -> str:
@@ -1376,11 +1386,13 @@ async def dispatch_inbox_command(
     await _update_thinking_status(deps, "🧠 Thinking with local Gemma 4 12B...")
 
     try:
-        history_messages = deps.context_window.to_pydantic_messages()
+        # Do not pass synthetic SystemPromptPart-less message_history here:
+        # PydanticAI skips all @agent.system_prompt functions (including inject_current_datetime,
+        # inject_temporal_context, and inject_rolling_context) whenever message_history is non-empty
+        # without an initial SystemPromptPart. Rolling history is already injected via inject_rolling_context.
         result = await active_agent.run(
             command,
             deps=deps,
-            message_history=history_messages if history_messages else None,
         )
         reply_text = result.output
         formatted_block = format_inbox_response(
